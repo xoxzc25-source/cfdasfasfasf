@@ -1,0 +1,1963 @@
+--═══════════════════════════════════════════════════════════════════
+--  EVIL MORTY // VFX CORE v50 — ОДИН LocalScript
+--  Куда: StarterPlayer → StarterPlayerScripts | Риг: R6
+--  НОВОЕ: лого «Злой Морти» в шапке (rbxassetid://102415835281067),
+--  тумблер ПРОЗРАЧНОСТИ панели, кнопка УДАЛИТЬ ИНТЕРФЕЙС
+--  ЩУПАЛЬЦА: Motor6D-веер (дуги наружу, без петель), один цикл анимации
+--  СКАН: старый скан одного игрока (8 сек) + АВТО-СКАН бесконечный
+--  ФЛИНГ: 100 м + крутилка времени · МЕЧ: ближний бой 10 м, насос
+--  ПРИСОСКА: держит выбранную жертву · Повязка всегда надета
+--═══════════════════════════════════════════════════════════════════
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local TweenService      = game:GetService("TweenService")
+local UserInputService  = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Debris            = game:GetService("Debris")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera      = workspace.CurrentCamera
+
+--──────────────────────────── НАСТРОЙКИ ────────────────────────────
+local CONFIG = {
+    -- ПОВЯЗКА (всегда надета)
+    MESH_ID    = "rbxassetid://134900896052713",
+    MESH_POS   = Vector3.new(0, 0.15, -0.05),
+    MESH_ROT   = Vector3.new(0, 0, 0),
+    MESH_COLOR = Color3.fromRGB(10, 10, 10),
+    MESH_KEEP        = {},  -- имена деталей-ПРОВОДОВ (не трогать)
+    MESH_FORCE_BLACK = {},  -- имена деталей-ЛЕНТЫ (чёрный всегда)
+    MESH_DEBUG       = false,
+
+    -- ЛОГО В ШАПКЕ (формат rbxassetid://ID; ScaleType.Fit = без искажений)
+    LOGO_ID = "rbxassetid://102415835281067",
+
+    -- ДРОНЫ
+    DRONE_COUNT  = 3,
+    ORBIT_RADIUS = 3.4,
+    ORBIT_SPEED  = 2.2,
+    ORBIT_HEIGHT = 0.4,
+    ORBIT_BOB    = 0.45,
+    ROTOR_SPEED  = 26,
+
+    -- ЩУПАЛЬЦА (Motor6D-веер)
+    TENT_COUNT = 6,
+    TENT_SEGS  = 8,
+
+    -- ЛАЗАНИЕ
+    CLIMB_SPEED  = 14,
+    CLIMB_SIDE   = 10,
+    LEAP_POWER   = 26,
+    WALL_LOST_GRACE = 0.5,
+    VAULT_BOOST  = 26,
+
+    -- ПРИСОСКА
+    SUCK_OFFSET = 2.6,
+
+    -- ФЛИНГ / МЕЧ
+    FLING_TIME     = 3,
+    FLING_RANGE    = 100,
+    SWORD_RANGE    = 10,
+    SWORD_COOLDOWN = 2,
+
+    -- СКАН (одного игрока)
+    SCAN_RANGE     = 300,
+    SCAN_DURATION  = 8,
+    SCAN_TRI_SIZE  = 3.2,
+    SCAN_TRI_IMAGE = "",
+    SCAN_GLOW      = 0.62,
+
+    -- ПАЛИТРА
+    C_GOLD   = Color3.fromRGB(255, 200, 40),
+    C_GOLD_D = Color3.fromRGB(180, 142, 55),
+    C_CYAN   = Color3.fromRGB(70, 235, 255),
+    C_ORANGE = Color3.fromRGB(255, 130, 20),
+    C_RED    = Color3.fromRGB(224, 42, 30),
+    C_DIM    = Color3.fromRGB(120, 92, 14),
+    C_TEXT   = Color3.fromRGB(255, 240, 210),
+    C_SUB    = Color3.fromRGB(170, 145, 90),
+}
+
+-- Крепления на спине (локаль торса): y высота, x разлёт
+local TENT_SLOTS = {
+    {y =  0.9, x = -0.55},
+    {y =  0.9, x =  0.55},
+    {y =  0.1, x = -0.75},
+    {y =  0.1, x =  0.75},
+    {y = -0.6, x = -0.85},
+    {y = -0.6, x =  0.85},
+}
+
+-- СУММАРНЫЙ изгиб каждого щупальца (распределяется по суставам:
+-- петля математически невозможна, дуги наружу-вверх/вниз)
+local TENT_ARC = {110, -110, 150, -150, 190, -190}
+
+local function create(class, props, parent)
+    local inst = Instance.new(class)
+    for k, v in pairs(props) do inst[k] = v end
+    inst.Parent = parent
+    return inst
+end
+
+local function merge(base, extra)
+    local t = table.clone(base)
+    for k, v in pairs(extra) do t[k] = v end
+    return t
+end
+
+--──────────────────────────── СОСТОЯНИЕ ────────────────────────────
+local char, root, head, humanoid, torso
+local meshAsset = nil
+local droneOn, drones = false, {}
+local tentOn, tentacles = false, {}
+local climbing = false
+local onCeiling = false
+local suckTarget = nil
+local markedTarget = nil
+local markedPlayer = nil
+local wallNormal = nil
+local wallLostSince = nil
+local climbVel = 0
+local jumpFlag = 0
+local vaultUntil = 0
+local orbitTime, lastFire = 0, 0
+local flinging, isOpen, autoScanOn = false, false, false
+local ghostOn = false -- тумблер прозрачности панели
+local swordBusy = false
+local OldPos = nil
+local FPDH = workspace.FallenPartsDestroyHeight
+
+local MESH_OFFSET = CFrame.new(CONFIG.MESH_POS)
+    * CFrame.Angles(math.rad(CONFIG.MESH_ROT.X), math.rad(CONFIG.MESH_ROT.Y), math.rad(CONFIG.MESH_ROT.Z))
+
+--─────────────────────── МОДУЛЬ 1: ПОВЯЗКА ─────────────────────────
+local cachedAsset
+
+local function detachMesh()
+    if meshAsset then meshAsset:Destroy() meshAsset = nil end
+end
+
+-- game:GetObjects("rbxassetid://...") — клиентская загрузка инстансов
+-- ассета без серверных прав. Возвращает ТАБЛИЦУ — берём несущий объект.
+local function loadMeshAsset()
+    if cachedAsset then return cachedAsset:Clone() end
+    local stored = ReplicatedStorage:FindFirstChild("EM_Headband")
+    if stored then cachedAsset = stored return stored:Clone() end
+    local ok, result = pcall(function() return game:GetObjects(CONFIG.MESH_ID) end)
+    if ok and type(result) == "table" then
+        for _, obj in ipairs(result) do
+            if obj:IsA("Accoutrement") or obj:IsA("Model") or obj:IsA("BasePart") then
+                cachedAsset = obj
+                return cachedAsset:Clone()
+            end
+        end
+    end
+    warn("[EvilMorty] Повязка не загрузилась: ", result)
+    return nil
+end
+
+local function attachMesh()
+    detachMesh()
+    if not (char and head and head.Parent) then return false end
+
+    local asset = loadMeshAsset()
+    if not asset then return false end
+    asset.Name = "EM_Headband_Local"
+
+    for _, obj in ipairs(asset:GetDescendants()) do
+        if obj:IsA("BaseScript") or obj:IsA("Sound")
+        or obj:IsA("Weld") or obj:IsA("WeldConstraint") then
+            obj:Destroy()
+        end
+    end
+
+    local pivotPart
+    if asset:IsA("BasePart") then
+        pivotPart = asset
+    elseif asset:IsA("Accoutrement") then
+        pivotPart = asset:FindFirstChild("Handle") or asset:FindFirstChildWhichIsA("BasePart", true)
+    else
+        pivotPart = asset.PrimaryPart or asset:FindFirstChildWhichIsA("BasePart", true)
+    end
+    if not pivotPart then asset:Destroy() return false end
+
+    local parts = {}
+    if asset:IsA("BasePart") then parts[1] = asset else
+        for _, p in ipairs(asset:GetDescendants()) do
+            if p:IsA("BasePart") then table.insert(parts, p) end
+        end
+    end
+
+    -- ПРАВИЛА: MESH_KEEP → провода (не трогать); MESH_FORCE_BLACK → лента.
+    -- Автомат: насыщенный Color/VertexColor (синие/красные провода) → не
+    -- трогаем; нейтральное → чёрное (VertexColor=0 нулит любую текстуру).
+    local function sat(c)
+        local _, s, v = c:ToHSV()
+        return s >= 0.4 and v >= 0.3
+    end
+
+    for _, p in ipairs(parts) do
+        p.Anchored   = false -- сварка работает только с неякорными
+        p.Massless   = true
+        p.CanCollide = false
+        p.CanQuery   = false
+        p.CanTouch   = false
+
+        local sm = p:FindFirstChildOfClass("SpecialMesh")
+        local vcColor = sm and Color3.new(sm.VertexColor.X, sm.VertexColor.Y, sm.VertexColor.Z) or nil
+
+        if CONFIG.MESH_DEBUG then
+            print(("[EvilMorty] '%s' class=%s size=%s color=%s vc=%s tex=%s"):format(
+                p.Name, p.ClassName, tostring(p.Size), tostring(p.Color),
+                sm and tostring(sm.VertexColor) or "—",
+                sm and tostring(sm.TextureId ~= "") or (p:IsA("MeshPart") and tostring(p.TextureID ~= "") or "—")))
+        end
+
+        if table.find(CONFIG.MESH_KEEP, p.Name) then
+            continue
+        end
+
+        local forceBlack = table.find(CONFIG.MESH_FORCE_BLACK, p.Name) ~= nil
+        local colorful = sat(p.Color) or (vcColor and sat(vcColor))
+
+        if forceBlack or not colorful then
+            if p:IsA("MeshPart") then p.TextureID = "" end
+            if sm then sm.TextureId = "" end
+            if sm then sm.VertexColor = Vector3.zero end
+            p.Color = CONFIG.MESH_COLOR
+            p.Material = Enum.Material.SmoothPlastic
+            p.Reflectance = 0
+        end
+    end
+
+    for _, obj in ipairs(asset:GetDescendants()) do
+        if obj:IsA("SurfaceAppearance") or obj:IsA("Decal") then obj:Destroy() end
+    end
+
+    for _, p in ipairs(parts) do
+        if p ~= pivotPart then
+            local wc = Instance.new("WeldConstraint")
+            wc.Part0 = pivotPart
+            wc.Part1 = p
+            wc.Parent = p
+        end
+    end
+
+    local weld = Instance.new("Weld")
+    weld.Part0 = head
+    weld.Part1 = pivotPart
+    weld.C0 = MESH_OFFSET
+    weld.Parent = pivotPart
+
+    meshAsset = asset
+    asset.Parent = char
+    return true
+end
+
+-- СТОРОЖ: повязку что-то снесло → вернуть за 1.5 сек (всегда надета)
+task.spawn(function()
+    while true do
+        task.wait(1.5)
+        if char and head and head.Parent then
+            if not meshAsset or not meshAsset.Parent or meshAsset.Parent ~= char then
+                attachMesh()
+            end
+        end
+    end
+end)
+
+--─────────────────── МОДУЛЬ 2: ДРОНЫ-КВАДРОКОПТЕРЫ ─────────────────
+local ROTOR_POS = {
+    Vector3.new( 0.85, 0.14, 0), Vector3.new(-0.85, 0.14, 0),
+    Vector3.new(0, 0.14, 0.85), Vector3.new(0, 0.14, -0.85),
+}
+
+local function clearDrones()
+    for _, d in ipairs(drones) do d.rig:Destroy() end
+    table.clear(drones)
+end
+
+local function createDrone(i)
+    local rig = Instance.new("Model")
+    rig.Name = "EM_Drone_" .. i
+    local HARD = {Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false}
+    local spinners = {}
+
+    local body = create("Part", merge(HARD, {
+        Name = "Body", Size = Vector3.new(0.5, 0.3, 0.75),
+        Material = Enum.Material.Metal, Color = Color3.fromRGB(24, 22, 14),
+        CFrame = CFrame.new(),
+    }), rig)
+    rig.PrimaryPart = body
+    body:SetAttribute("OT", 0)
+
+    create("Part", merge(HARD, {
+        Name = "Plate", Size = Vector3.new(0.36, 0.06, 0.52),
+        Material = Enum.Material.Metal, Color = CONFIG.C_GOLD_D,
+        CFrame = CFrame.new(0, 0.18, 0),
+    }), rig):SetAttribute("OT", 0)
+
+    for _, x in ipairs({-0.12, 0.12}) do
+        create("Part", merge(HARD, {
+            Name = "Eye", Size = Vector3.new(0.16, 0.05, 0.02),
+            Material = Enum.Material.Neon, Color = CONFIG.C_CYAN,
+            CFrame = CFrame.new(x, 0.05, -0.38),
+        }), rig):SetAttribute("OT", 0)
+    end
+
+    for _, dims in ipairs({{Size = Vector3.new(1.8, 0.05, 0.08)}, {Size = Vector3.new(0.08, 0.05, 1.8)}}) do
+        create("Part", merge(HARD, {
+            Name = "Arm", Size = dims.Size,
+            Material = Enum.Material.Metal, Color = Color3.fromRGB(30, 27, 16),
+            CFrame = CFrame.new(0, 0.1, 0),
+        }), rig):SetAttribute("OT", 0)
+    end
+
+    for idx, pos in ipairs(ROTOR_POS) do
+        local dir = (idx % 2 == 0) and -1 or 1
+        create("Part", merge(HARD, {
+            Name = "Hub", Shape = Enum.PartType.Ball, Size = Vector3.new(0.1, 0.1, 0.1),
+            Material = Enum.Material.Neon, Color = CONFIG.C_CYAN,
+            CFrame = CFrame.new(pos + Vector3.new(0, 0.04, 0)),
+        }), rig):SetAttribute("OT", 0)
+
+        -- Ось X базы повёрнута вертикально (roll 90°) → винт крутится Angles(angle,0,0)
+        local rotorBase = CFrame.new(pos) * CFrame.Angles(0, 0, math.rad(90))
+
+        local disc = create("Part", merge(HARD, {
+            Name = "Disc", Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.02, 0.82, 0.82),
+            Material = Enum.Material.Neon, Color = CONFIG.C_CYAN,
+        }), rig)
+        disc:SetAttribute("OT", 0.75)
+        table.insert(spinners, {part = disc, rel = rotorBase, dir = dir, phase = 0})
+
+        for b = 0, 2 do
+            local blade = create("Part", merge(HARD, {
+                Name = "Blade", Size = Vector3.new(0.03, 0.76, 0.06),
+                Material = Enum.Material.Metal, Color = CONFIG.C_GOLD_D,
+            }), rig)
+            blade:SetAttribute("OT", 0)
+            table.insert(spinners, {part = blade, rel = rotorBase, dir = dir, phase = b * (math.pi * 2 / 3)})
+        end
+    end
+
+    create("PointLight", {Color = CONFIG.C_CYAN, Range = 7, Brightness = 1.3}, body)
+    create("ParticleEmitter", {
+        Texture = "rbxasset://textures/particles/sparkles_main.dds",
+        Color = ColorSequence.new(CONFIG.C_CYAN, CONFIG.C_GOLD),
+        LightEmission = 1, Size = NumberSequence.new(0.15),
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0.2),
+            NumberSequenceKeypoint.new(1, 1),
+        }),
+        Lifetime = NumberRange.new(0.3, 0.6),
+        Rate = 15, Speed = NumberRange.new(0.4, 1.2),
+        SpreadAngle = Vector2.new(180, 180),
+    }, body)
+
+    local a0 = create("Attachment", {Position = Vector3.new(0, 0.18, 0)}, body)
+    local a1 = create("Attachment", {Position = Vector3.new(0, -0.18, 0)}, body)
+    create("Trail", {
+        Attachment0 = a0, Attachment1 = a1, Lifetime = 0.25,
+        Color = ColorSequence.new(CONFIG.C_CYAN, CONFIG.C_GOLD),
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0.35),
+            NumberSequenceKeypoint.new(1, 1),
+        }),
+        LightEmission = 1, FaceCamera = true,
+    }, body)
+
+    rig.Parent = char
+    return {rig = rig, spinners = spinners}
+end
+
+local function createDrones()
+    clearDrones()
+    for i = 1, CONFIG.DRONE_COUNT do drones[i] = createDrone(i) end
+end
+
+local function setDroneVisuals()
+    for _, d in ipairs(drones) do
+        for _, p in ipairs(d.rig:GetDescendants()) do
+            if p:IsA("BasePart") then
+                p.Transparency = droneOn and (p:GetAttribute("OT") or 0) or 1
+            elseif p:IsA("ParticleEmitter") or p:IsA("PointLight") or p:IsA("Trail") then
+                p.Enabled = droneOn
+            end
+        end
+    end
+end
+
+--─────────── МОДУЛЬ 5: ЩУПАЛЬЦА (Motor6D-веер) ─────────────────────
+-- Цепочка растёт вверх от спины. Суммарный изгиб (TENT_ARC) распределён
+-- по суставам → дуги наружу, петля невозможна. Один цикл анимации.
+local function clearTentacles()
+    for _, t in ipairs(tentacles) do t.rig:Destroy() end
+    table.clear(tentacles)
+    climbing = false
+    onCeiling = false
+    wallNormal = nil
+    wallLostSince = nil
+end
+
+local function createTentacles()
+    clearTentacles()
+    if not (char and root and torso and torso.Parent) then return end
+
+    for i = 1, CONFIG.TENT_COUNT do
+        local slot = TENT_SLOTS[((i - 1) % #TENT_SLOTS) + 1]
+        local totalArc = TENT_ARC[((i - 1) % #TENT_ARC) + 1]
+        local rig = Instance.new("Model")
+        rig.Name = "EM_Tentacle_" .. i
+
+        local motors = {}
+        local baseRad = {}
+
+        local prevPart = torso
+        local jointC0 = CFrame.new(slot.x, slot.y, 0.55) -- сустав на спине
+
+        for s = 1, CONFIG.TENT_SEGS do
+            local w = 0.36 * (1 - (s - 1) / CONFIG.TENT_SEGS * 0.55)
+            local seg = create("Part", {
+                Name = "Seg" .. s,
+                Size = Vector3.new(w, 0.42, w), -- длинная ось Y (вдоль цепочки)
+                Material = (s % 3 == 0) and Enum.Material.Neon or Enum.Material.Metal,
+                Color = (s % 3 == 0) and CONFIG.C_CYAN
+                    or ((s % 2 == 0) and Color3.fromRGB(52, 56, 64) or Color3.fromRGB(36, 39, 45)),
+                CanCollide = false, CanQuery = false, CanTouch = false,
+                Massless = true,
+            }, rig)
+
+            local m = Instance.new("Motor6D")
+            m.Part0 = prevPart
+            m.Part1 = seg
+            if s == 1 then
+                m.C0 = jointC0                 -- сустав на спине
+                m.C1 = CFrame.new(0, -0.21, 0) -- низ блока у сустава
+            else
+                m.C0 = CFrame.new(0, 0.21, 0)  -- верх предыдущего блока
+                m.C1 = CFrame.new(0, -0.21, 0) -- низ этого блока
+            end
+            m.MaxVelocity = 100 -- мгновенный отклик на синусоиду
+            m.Parent = prevPart
+            table.insert(motors, m)
+
+            -- ДОЛЯ суммарного изгиба (равномерно + усиление к кончику)
+            local share = totalArc / CONFIG.TENT_SEGS * (0.8 + s * 0.05)
+            table.insert(baseRad, math.rad(share))
+
+            prevPart = seg
+        end
+
+        -- коготь: бирюзовое ядро + 4 золотых луча на кончике
+        local last = rig:FindFirstChild("Seg" .. CONFIG.TENT_SEGS)
+        if last then
+            local core = create("Part", {
+                Shape = Enum.PartType.Ball, Size = Vector3.new(0.4, 0.4, 0.4),
+                Material = Enum.Material.Neon, Color = CONFIG.C_CYAN,
+                CanCollide = false, CanQuery = false, CanTouch = false, Massless = true,
+            }, rig)
+            local mc = Instance.new("Motor6D")
+            mc.Part0 = last
+            mc.Part1 = core
+            mc.C0 = CFrame.new(0, 0.21, 0)
+            mc.C1 = CFrame.new(0, 0, 0)
+            mc.MaxVelocity = 100
+            mc.Parent = last
+            table.insert(motors, mc)
+            table.insert(baseRad, math.rad(totalArc / CONFIG.TENT_SEGS))
+            for k = 1, 4 do
+                local claw = create("Part", {
+                    Size = Vector3.new(0.72, 0.08, 0.2),
+                    Material = Enum.Material.Metal, Color = CONFIG.C_GOLD_D,
+                    CanCollide = false, CanQuery = false, CanTouch = false, Massless = true,
+                }, rig)
+                local mw = Instance.new("Weld")
+                mw.Part0 = core
+                mw.Part1 = claw
+                mw.C0 = CFrame.Angles(0, math.rad(k * 90 + 45), 0) * CFrame.new(0, 0, 0.5)
+                mw.Parent = claw
+            end
+            create("PointLight", {Color = CONFIG.C_CYAN, Range = 8, Brightness = 2}, core)
+        end
+
+        rig.Parent = char
+        tentacles[i] = {rig = rig, motors = motors, baseRad = baseRad, phase = i * 1.05}
+    end
+end
+
+local function getNearestTarget(range)
+    range = range or 60
+    if not (root and root.Parent) then return nil end
+    local bestChar, bestDist = nil, range
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
+            local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+            if hrp and hum and hum.Health > 0 then
+                local dist = (hrp.Position - root.Position).Magnitude
+                if dist < bestDist then
+                    bestChar, bestDist = plr.Character, dist
+                end
+            end
+        end
+    end
+    return bestChar, bestDist
+end
+
+--─────────────────────────── UI: ПАНЕЛЬ ────────────────────────────
+local gui = create("ScreenGui", {
+    Name = "EvilMortyCore", ResetOnSpawn = false,
+    IgnoreGuiInset = true, -- заливка скана покрывает ВЕСЬ экран (вкл. зону чата)
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, LocalPlayer:WaitForChild("PlayerGui"))
+
+-- ЖЁЛТАЯ ЗАЛИВКА ЭКРАНА (плавная, анимация в RenderStepped — без мерцания)
+local scanOverlay = create("Frame", {
+    Size = UDim2.fromScale(1, 1),
+    BackgroundColor3 = CONFIG.C_GOLD,
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0, Visible = false, ZIndex = 1,
+}, gui)
+create("UIGradient", {
+    Color = ColorSequence.new(Color3.fromRGB(255, 225, 100), Color3.fromRGB(255, 165, 20)),
+    Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.25),
+        NumberSequenceKeypoint.new(0.5, 0.5),
+        NumberSequenceKeypoint.new(1, 0.25),
+    }),
+    Rotation = 90,
+}, scanOverlay)
+
+local click = create("Sound", {
+    SoundId = "rbxasset://sounds/electronicpingshort.wav",
+    Volume = 0.4, PlaybackSpeed = 1.1,
+}, gui)
+
+local notice = create("TextLabel", {
+    AnchorPoint = Vector2.new(0.5, 0),
+    Position = UDim2.new(0.5, 0, 0.1, 0),
+    Size = UDim2.fromOffset(420, 34),
+    BackgroundColor3 = Color3.fromRGB(16, 13, 5), BackgroundTransparency = 0.25,
+    Font = Enum.Font.GothamBold, Text = "", TextSize = 16,
+    TextColor3 = CONFIG.C_GOLD, BorderSizePixel = 0, Visible = false, ZIndex = 6,
+}, gui)
+create("UICorner", {CornerRadius = UDim.new(0, 8)}, notice)
+create("UIStroke", {Color = CONFIG.C_GOLD, Thickness = 1.5}, notice)
+
+local function showNotice(text, color)
+    notice.Text = text
+    notice.TextColor3 = color or CONFIG.C_GOLD
+    notice.Visible = true
+    task.delay(2.2, function()
+        if notice.Text == text then notice.Visible = false end
+    end)
+end
+
+local toggleBtn = create("TextButton", {
+    Size = UDim2.fromOffset(52, 52),
+    Position = UDim2.new(1, -16, 1, -16), AnchorPoint = Vector2.new(1, 1),
+    BackgroundColor3 = Color3.fromRGB(18, 14, 4), Text = "EM",
+    TextColor3 = CONFIG.C_GOLD, Font = Enum.Font.PermanentMarker, TextSize = 20,
+    AutoButtonColor = false, BorderSizePixel = 0, ZIndex = 5,
+}, gui)
+create("UICorner", {CornerRadius = UDim.new(1, 0)}, toggleBtn)
+local toggleStroke = create("UIStroke", {Color = CONFIG.C_GOLD, Thickness = 2.5}, toggleBtn)
+TweenService:Create(toggleStroke, TweenInfo.new(1.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {Transparency = 0.7}):Play()
+
+local panel = create("CanvasGroup", {
+    Size = UDim2.fromOffset(280, 620),
+    Position = UDim2.fromScale(0.5, 0.5), AnchorPoint = Vector2.new(0.5, 0.5),
+    BackgroundColor3 = Color3.fromRGB(16, 13, 5), Visible = false, BorderSizePixel = 0, ZIndex = 5,
+}, gui)
+create("UICorner", {CornerRadius = UDim.new(0, 14)}, panel)
+create("UIStroke", {Color = CONFIG.C_GOLD, Thickness = 2, Transparency = 0.35}, panel)
+local uiScale = create("UIScale", {}, panel)
+
+local targetScale = 1
+local function updateScale()
+    local vp = Camera.ViewportSize
+    targetScale = math.clamp(math.min(vp.X / 420, vp.Y / 680), 0.5, 1)
+    if not isOpen then uiScale.Scale = targetScale end
+end
+
+local dragZone = create("Frame", {
+    Name = "DragZone", Size = UDim2.new(1, 0, 0, 54),
+    BackgroundTransparency = 1, Active = true, BorderSizePixel = 0,
+}, panel)
+
+create("TextLabel", {
+    BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 8),
+    Size = UDim2.new(1, -120, 0, 26), Font = Enum.Font.PermanentMarker,
+    Text = "EVIL MORTY", TextColor3 = CONFIG.C_GOLD, TextSize = 22,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, dragZone)
+create("TextLabel", {
+    BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 34),
+    Size = UDim2.new(1, -120, 0, 12), Font = Enum.Font.Code,
+    Text = "ADMIN VFX CORE // MORTY PRIME", TextColor3 = CONFIG.C_SUB, TextSize = 9,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, dragZone)
+
+-- ЛОГО «ЗЛОЙ МОРТИ» — ImageLabel по rbxassetid://ID, ScaleType.Fit
+-- (масштаб без искажений). Стоит СПРАВА в шапке. Если нужен зеркальный
+-- разворот — поменяй Rotation на 180.
+if CONFIG.LOGO_ID ~= "" then
+    create("ImageLabel", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -10, 0.5, 0),
+        Size = UDim2.fromOffset(100, 34),
+        BackgroundTransparency = 1,
+        Image = CONFIG.LOGO_ID,            -- ← rbxassetid://102415835281067
+        ScaleType = Enum.ScaleType.Fit,    -- вписать без искажений
+    }, dragZone)
+end
+
+local rings = {}
+local function makeRing(diameter, thickness, speed, transparency, parent, pos)
+    local ring = create("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = pos or UDim2.new(1, -34, 0.5, 0),
+        Size = UDim2.fromOffset(diameter, diameter),
+        BackgroundTransparency = 1, BorderSizePixel = 0,
+    }, parent)
+    create("UICorner", {CornerRadius = UDim.new(1, 0)}, ring)
+    local s = create("UIStroke", {Color = CONFIG.C_GOLD, Thickness = thickness, Transparency = transparency}, ring)
+    create("UIGradient", {
+        Color = ColorSequence.new(CONFIG.C_GOLD, CONFIG.C_CYAN),
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.3, 0),
+            NumberSequenceKeypoint.new(0.55, 1),
+            NumberSequenceKeypoint.new(0.8, 0.2),
+            NumberSequenceKeypoint.new(1, 1),
+        }),
+    }, s)
+    table.insert(rings, {frame = ring, speed = speed})
+end
+makeRing(42, 2.5, 60, 0.15)
+makeRing(27, 2, -100, 0.35)
+
+create("Frame", {
+    Position = UDim2.fromOffset(14, 58), Size = UDim2.new(1, -28, 0, 1),
+    BackgroundColor3 = CONFIG.C_DIM, BackgroundTransparency = 0.6, BorderSizePixel = 0,
+}, panel)
+
+local function makeButton(key, text, yPos)
+    local btn = create("TextButton", {
+        Name = key, Position = UDim2.fromOffset(14, yPos),
+        Size = UDim2.new(1, -28, 0, 34),
+        BackgroundColor3 = Color3.fromRGB(24, 19, 8),
+        AutoButtonColor = false, Text = "", BorderSizePixel = 0,
+    }, panel)
+    create("UICorner", {CornerRadius = UDim.new(0, 8)}, btn)
+    local stroke = create("UIStroke", {Color = CONFIG.C_DIM, Thickness = 1.2, Transparency = 0.2}, btn)
+    local label = create("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 0),
+        Size = UDim2.new(1, -38, 1, 0), Font = Enum.Font.GothamBold,
+        Text = text, TextColor3 = CONFIG.C_TEXT, TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, btn)
+    local dot = create("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(1, -14, 0.5, 0),
+        Size = UDim2.fromOffset(7, 7), BackgroundColor3 = CONFIG.C_DIM,
+        BorderSizePixel = 0,
+    }, btn)
+    create("UICorner", {CornerRadius = UDim.new(1, 0)}, dot)
+    return {btn = btn, label = label, dot = dot, stroke = stroke}
+end
+
+local bDrones = makeButton("Drones", "ДРОНЫ // ОРБИТА",      66)
+local bFire   = makeButton("Fire",   "ФЛИНГ // SKIDFLING",   106)
+local bSword  = makeButton("Sword",  "МЕЧ МОРТИ",            146)
+local bTent   = makeButton("Tent",   "ЩУПАЛЬЦА",             186)
+local bMark   = makeButton("Mark",   "ВЫБРАТЬ ЦЕЛЬ",         226)
+local bSuck   = makeButton("Suck",   "ПРИСОСКА // ЗА СПИНУ", 266)
+local bScan   = makeButton("Scan",   "СКАН МОЗГА",           306)
+local bAuto   = makeButton("Auto",   "АВТО-СКАН: ВЫКЛ",       346)
+local bGhost  = makeButton("Ghost",  "ПРОЗРАЧНОСТЬ: ВЫКЛ",    386)
+local bClose  = makeButton("Close",  "✕ УДАЛИТЬ ИНТЕРФЕЙС",   426)
+
+local function setButtonState(b, on)
+    b.stroke.Color = on and CONFIG.C_GOLD or CONFIG.C_DIM
+    b.stroke.Transparency = on and 0 or 0.2
+    b.dot.BackgroundColor3 = on and CONFIG.C_GOLD or CONFIG.C_DIM
+    b.label.TextColor3 = on and CONFIG.C_GOLD or CONFIG.C_TEXT
+end
+
+-- СПИСОК ИГРОКОВ
+local playerList = create("Frame", {
+    Size = UDim2.new(1, -28, 0, 116),
+    Position = UDim2.fromOffset(14, 262),
+    BackgroundColor3 = Color3.fromRGB(14, 11, 4),
+    BorderSizePixel = 0, Visible = false, ZIndex = 6,
+}, panel)
+create("UICorner", {CornerRadius = UDim.new(0, 8)}, playerList)
+create("UIStroke", {Color = CONFIG.C_GOLD, Thickness = 1.2}, playerList)
+
+local scroll = create("ScrollingFrame", {
+    Size = UDim2.new(1, -8, 1, -8), Position = UDim2.fromOffset(4, 4),
+    BackgroundTransparency = 1, BorderSizePixel = 0,
+    ScrollBarThickness = 3, ScrollBarImageColor3 = CONFIG.C_GOLD,
+    CanvasSize = UDim2.new(0, 0, 0, 0), ZIndex = 6,
+}, playerList)
+create("UIListLayout", {Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder}, scroll)
+
+local function refreshPlayerList()
+    for _, c in ipairs(scroll:GetChildren()) do
+        if c:IsA("TextButton") then c:Destroy() end
+    end
+    local list = Players:GetPlayers()
+    table.sort(list, function(a, b) return a.DisplayName:lower() < b.DisplayName:lower() end)
+    for idx, plr in ipairs(list) do
+        if plr ~= LocalPlayer then
+            local item = create("TextButton", {
+                Size = UDim2.new(1, -6, 0, 25),
+                BackgroundColor3 = Color3.fromRGB(24, 19, 8),
+                AutoButtonColor = false, Text = "", BorderSizePixel = 0,
+                LayoutOrder = idx, ZIndex = 6,
+            }, scroll)
+            create("UICorner", {CornerRadius = UDim.new(0, 5)}, item)
+            create("TextLabel", {
+                BackgroundTransparency = 1, Size = UDim2.new(1, -44, 1, 0),
+                Position = UDim2.fromOffset(8, 0),
+                Font = Enum.Font.GothamBold, Text = plr.DisplayName,
+                TextSize = 11, TextColor3 = CONFIG.C_TEXT,
+                TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 6,
+            }, item)
+            local distL = create("TextLabel", {
+                AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -6, 0.5, 0),
+                Size = UDim2.fromOffset(36, 16), BackgroundTransparency = 1,
+                Font = Enum.Font.Code, Text = "—", TextSize = 9,
+                TextColor3 = CONFIG.C_SUB, ZIndex = 6,
+            }, item)
+            if plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") and root then
+                distL.Text = ("%.0fм"):format((plr.Character.HumanoidRootPart.Position - root.Position).Magnitude)
+            end
+            item.Activated:Connect(function()
+                click:Play()
+                local hum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+                if plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+                and hum and hum.Health > 0 then
+                    markedTarget = plr.Character
+                    markedPlayer = plr
+                    setButtonState(bMark, true)
+                    showNotice("ЦЕЛЬ: " .. plr.DisplayName, CONFIG.C_GOLD)
+                    playerList.Visible = false
+                else
+                    showNotice("ИГРОК НЕ ДОСТУПЕН", CONFIG.C_RED)
+                end
+            end)
+        end
+    end
+    scroll.CanvasSize = UDim2.new(0, 0, 0, #list * 28)
+end
+
+local statusFrame = create("Frame", {
+    Position = UDim2.fromOffset(14, 468), Size = UDim2.new(1, -28, 0, 24),
+    BackgroundColor3 = Color3.fromRGB(12, 10, 4), BorderSizePixel = 0,
+}, panel)
+create("UICorner", {CornerRadius = UDim.new(0, 6)}, statusFrame)
+create("UIStroke", {Color = CONFIG.C_DIM, Thickness = 1, Transparency = 0.5}, statusFrame)
+local statusLabel = create("TextLabel", {
+    BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 0),
+    Size = UDim2.new(1, -20, 1, 0), Font = Enum.Font.Code,
+    Text = "ЦЕЛЬ: —", TextSize = 11, TextColor3 = CONFIG.C_SUB,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, statusFrame)
+
+create("TextLabel", {
+    BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 1),
+    Position = UDim2.new(0.5, 0, 1, -6), Size = UDim2.new(1, -32, 0, 14),
+    Font = Enum.Font.Code, Text = "MORTY PRIME // THE ONE TRUE MORTY",
+    TextSize = 9, TextColor3 = Color3.fromRGB(140, 115, 50),
+}, panel)
+
+-- Тумблер прозрачности меняет GroupTransparency всей панели
+local function ghostTarget()
+    return ghostOn and 0.5 or 0
+end
+
+local function setOpen(v)
+    isOpen = v
+    click:Play()
+    playerList.Visible = false
+    if v then
+        panel.Visible = true
+        panel.GroupTransparency = 1
+        uiScale.Scale = targetScale * 0.85
+        TweenService:Create(panel, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {GroupTransparency = ghostTarget()}):Play()
+        TweenService:Create(uiScale, TweenInfo.new(0.28, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Scale = targetScale}):Play()
+    else
+        TweenService:Create(panel, TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {GroupTransparency = 1}):Play()
+        TweenService:Create(uiScale, TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {Scale = targetScale * 0.85}):Play()
+        task.delay(0.18, function()
+            if not isOpen then panel.Visible = false end
+        end)
+    end
+end
+
+--──────────── ПЕРЕТАСКИВАНИЕ ПАЛЬЦЕМ ───────────────────────────────
+local isTouch = function(input)
+    return input.UserInputType == Enum.UserInputType.Touch
+        or input.UserInputType == Enum.UserInputType.MouseButton1
+end
+local isMove = function(input)
+    return input.UserInputType == Enum.UserInputType.Touch
+        or input.UserInputType == Enum.UserInputType.MouseMovement
+end
+
+local panelDrag, panelStart, panelStartPos = false, nil, nil
+local function hookPress(obj)
+    obj.InputBegan:Connect(function(input)
+        if isTouch(input) then
+            panelDrag = true
+            panelStart = input.Position
+            panelStartPos = panel.Position
+        end
+    end)
+end
+hookPress(panel)
+hookPress(dragZone)
+hookPress(statusFrame)
+
+local btnDrag, btnStart, btnStartPos, btnMoved = false, nil, nil, false
+toggleBtn.InputBegan:Connect(function(input)
+    if isTouch(input) then
+        btnDrag, btnMoved = true, false
+        btnStart = input.Position
+        btnStartPos = toggleBtn.Position
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if not isMove(input) then return end
+    if panelDrag then
+        local d = input.Position - panelStart
+        panel.Position = UDim2.new(panelStartPos.X.Scale, panelStartPos.X.Offset + d.X,
+                                   panelStartPos.Y.Scale, panelStartPos.Y.Offset + d.Y)
+    end
+    if btnDrag then
+        local d = input.Position - btnStart
+        if math.abs(d.X) + math.abs(d.Y) > 12 then btnMoved = true end
+        toggleBtn.Position = UDim2.new(btnStartPos.X.Scale, btnStartPos.X.Offset + d.X,
+                                       btnStartPos.Y.Scale, btnStartPos.Y.Offset + d.Y)
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if isTouch(input) then
+        panelDrag = false
+        btnDrag = false
+    end
+end)
+
+toggleBtn.Activated:Connect(function()
+    if btnMoved then btnMoved = false return end
+    setOpen(not isOpen)
+end)
+
+--───────────────────── МОДУЛЬ 4: СКАН (одного игрока) ──────────────
+-- Прицел или ближайший → треугольник-голограмма, живой HP, луч от
+-- повязки, жёлтое свечение экрана, 8 сек. АВТО-СКАН сам запускает
+-- новый скан после окончания предыдущего.
+local scanToken = 0
+local scanRefs = {gui = nil, triGui = nil, beam = nil, atts = {}, hl = nil, light = nil, target = nil}
+
+local function stopScan()
+    scanToken += 1
+    scanOverlay.Visible = false
+    if scanRefs.gui    then scanRefs.gui:Destroy()    scanRefs.gui    = nil end
+    if scanRefs.triGui then scanRefs.triGui:Destroy() scanRefs.triGui = nil end
+    if scanRefs.beam   then scanRefs.beam:Destroy()   scanRefs.beam   = nil end
+    for _, a in ipairs(scanRefs.atts or {}) do
+        if a then a:Destroy() end
+    end
+    scanRefs.atts = {}
+    if scanRefs.hl    then scanRefs.hl:Destroy()    scanRefs.hl    = nil end
+    if scanRefs.light then scanRefs.light:Destroy() scanRefs.light = nil end
+    scanRefs.target = nil
+end
+
+local function hpColor(r)
+    if r > 0.6 then return CONFIG.C_GOLD
+    elseif r > 0.3 then return CONFIG.C_ORANGE
+    else return CONFIG.C_RED end
+end
+
+local function triOutline(container, verts, thickness, color, transparency)
+    for i = 1, 3 do
+        local a, b = verts[i], verts[i % 3 + 1]
+        local mid = (a + b) / 2
+        local d = b - a
+        local len = d.Magnitude
+        create("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(mid.X, mid.Y),
+            Size = UDim2.fromScale(len * 1.06, thickness),
+            Rotation = math.deg(math.atan2(d.Y, d.X)),
+            BackgroundColor3 = color,
+            BackgroundTransparency = transparency or 0,
+            BorderSizePixel = 0,
+        }, container)
+    end
+end
+
+local function makeTriangleLogo(parent)
+    local container = create("Frame", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1, BorderSizePixel = 0,
+    }, parent)
+    local A, B, C = Vector2.new(0.5, 0.04), Vector2.new(0.96, 0.93), Vector2.new(0.04, 0.93)
+    triOutline(container, {A, B, C}, 0.045, CONFIG.C_RED)
+    local cx, cy, k = 0.5, 0.62, 0.66
+    local function shrink(p)
+        return Vector2.new(cx + (p.X - cx) * k, cy + (p.Y - cy) * k)
+    end
+    triOutline(container, {shrink(A), shrink(B), shrink(C)}, 0.018, Color3.fromRGB(255, 238, 180), 0.05)
+    create("TextLabel", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.56), Size = UDim2.fromScale(0.4, 0.4),
+        BackgroundTransparency = 1, Font = Enum.Font.SourceSansBold,
+        Text = "🧠", TextScaled = true,
+        TextColor3 = Color3.fromRGB(255, 238, 180),
+    }, container)
+    return container
+end
+
+local function startScan(targetChar)
+    local tHead = targetChar:FindFirstChild("Head") or targetChar:FindFirstChild("HumanoidRootPart")
+    local tHum  = targetChar:FindFirstChildOfClass("Humanoid")
+    if not (head and tHead and tHum) then return end
+    if scanRefs.target == targetChar and scanRefs.gui and scanRefs.gui.Parent then
+        return
+    end
+    stopScan()
+    scanToken += 1
+    local token = scanToken
+    scanRefs.target = targetChar
+
+    -- заливка экрана: ПЛАВНОЕ свечение в RenderStepped (без мерцания)
+    scanOverlay.Visible = true
+    scanOverlay.BackgroundTransparency = 1
+
+    scanRefs.hl = create("Highlight", {
+        FillColor = CONFIG.C_GOLD, FillTransparency = 0.62,
+        OutlineColor = Color3.fromRGB(255, 235, 160), OutlineTransparency = 0.15,
+        DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+    }, targetChar)
+
+    local a0 = Instance.new("Attachment")
+    a0.Parent = head
+    local a1 = Instance.new("Attachment")
+    a1.Parent = tHead
+    scanRefs.atts = {a0, a1}
+    scanRefs.beam = create("Beam", {
+        Attachment0 = a0, Attachment1 = a1,
+        Color = ColorSequence.new(CONFIG.C_GOLD, CONFIG.C_ORANGE),
+        Width0 = 0.07, Width1 = 0.02,
+        LightEmission = 1, FaceCamera = true,
+        Transparency = NumberSequence.new(0.4),
+    }, head)
+    scanRefs.light = create("PointLight", {
+        Color = CONFIG.C_GOLD, Range = 12, Brightness = 2,
+    }, tHead)
+
+    local triGui = Instance.new("BillboardGui")
+    triGui.Name = "EM_ScanTri"
+    triGui.Adornee = tHead
+    triGui.Size = UDim2.new(CONFIG.SCAN_TRI_SIZE, 0, CONFIG.SCAN_TRI_SIZE, 0)
+    triGui.StudsOffset = Vector3.new(0, 0.35, 0)
+    triGui.AlwaysOnTop = true
+    triGui.MaxDistance = 600
+
+    if CONFIG.SCAN_TRI_IMAGE ~= "" then
+        create("ImageLabel", {
+            Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+            Image = CONFIG.SCAN_TRI_IMAGE, ScaleType = Enum.ScaleType.Fit,
+        }, triGui)
+    else
+        makeTriangleLogo(triGui)
+    end
+    triGui.Parent = gui
+    scanRefs.triGui = triGui
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "EM_Scan"
+    billboard.Adornee = tHead
+    billboard.Size = UDim2.new(5, 0, 2.6, 0)
+    billboard.StudsOffset = Vector3.new(0, 0.35 + CONFIG.SCAN_TRI_SIZE / 2 + 1.35, 0)
+    billboard.AlwaysOnTop = true
+    billboard.MaxDistance = 600
+
+    local title = create("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.fromScale(0, 0),
+        Size = UDim2.fromScale(1, 0.17), Font = Enum.Font.GothamBold,
+        Text = "SCANNING BRAIN.", TextScaled = true, TextColor3 = CONFIG.C_GOLD,
+        TextStrokeColor3 = Color3.fromRGB(60, 20, 0), TextStrokeTransparency = 0.25,
+    }, billboard)
+    local nameL = create("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.fromScale(0, 0.19),
+        Size = UDim2.fromScale(1, 0.13), Font = Enum.Font.Code,
+        Text = "", TextScaled = true, TextColor3 = CONFIG.C_TEXT,
+        TextStrokeColor3 = Color3.fromRGB(60, 20, 0), TextStrokeTransparency = 0.35,
+    }, billboard)
+    local hpText = create("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.fromScale(0, 0.34),
+        Size = UDim2.fromScale(1, 0.11), Font = Enum.Font.Code,
+        Text = "", TextScaled = true, TextColor3 = CONFIG.C_GOLD,
+        TextStrokeColor3 = Color3.fromRGB(60, 20, 0), TextStrokeTransparency = 0.35,
+    }, billboard)
+    local barBg = create("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.48),
+        Size = UDim2.fromScale(0.62, 0.05),
+        BackgroundColor3 = Color3.fromRGB(40, 22, 0), BackgroundTransparency = 0.3,
+        BorderSizePixel = 0,
+    }, billboard)
+    create("UICorner", {CornerRadius = UDim.new(1, 0)}, barBg)
+    local barFill = create("Frame", {
+        Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = CONFIG.C_RED,
+        BorderSizePixel = 0,
+    }, barBg)
+    create("UICorner", {CornerRadius = UDim.new(1, 0)}, barFill)
+    local distL = create("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.fromScale(0, 0.57),
+        Size = UDim2.fromScale(1, 0.11), Font = Enum.Font.Code,
+        Text = "", TextScaled = true, TextColor3 = CONFIG.C_SUB,
+        TextStrokeColor3 = Color3.fromRGB(60, 20, 0), TextStrokeTransparency = 0.35,
+    }, billboard)
+    local statL = create("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.fromScale(0, 0.70),
+        Size = UDim2.fromScale(1, 0.11), Font = Enum.Font.Code,
+        Text = "", TextScaled = true, TextColor3 = CONFIG.C_GOLD,
+        TextStrokeColor3 = Color3.fromRGB(60, 20, 0), TextStrokeTransparency = 0.35,
+    }, billboard)
+
+    billboard.Parent = gui
+    scanRefs.gui = billboard
+
+    local scanSnd = create("Sound", {
+        SoundId = "rbxasset://sounds/electronicpingshort.wav",
+        Volume = 0.5, PlaybackSpeed = 0.7,
+    }, gui)
+    scanSnd:Play()
+
+    local tPlr = Players:GetPlayerFromCharacter(targetChar)
+    local subjName = tPlr and tPlr.DisplayName or targetChar.Name
+
+    task.spawn(function()
+        local t0 = os.clock()
+        while os.clock() - t0 < 1.4 and token == scanToken do
+            local el = os.clock() - t0
+            if not tHead.Parent then stopScan() return end
+            title.Text = "SCANNING BRAIN" .. string.rep(".", math.floor(el * 4) % 4)
+            barFill.Size = UDim2.new(math.clamp(el / 1.4, 0, 1), 0, 1, 0)
+            task.wait(0.07)
+        end
+        if token ~= scanToken then return end
+        title.Text = "SCAN COMPLETE."
+        nameL.Text = "SUBJECT: " .. subjName
+
+        while os.clock() - t0 < 1.4 + CONFIG.SCAN_DURATION and token == scanToken do
+            if not (tHum.Parent and tHead.Parent) then stopScan() return end
+            local hp, mx = tHum.Health, math.max(tHum.MaxHealth, 1)
+            local r = math.clamp(hp / mx, 0, 1)
+            barFill.Size = UDim2.new(r, 0, 1, 0)
+            barFill.BackgroundColor3 = hpColor(r)
+            hpText.Text = ("HP: %d / %d"):format(math.floor(hp + 0.5), math.floor(mx + 0.5))
+            if head and head.Parent then
+                distL.Text = ("DIST: %.0f м"):format((tHead.Position - head.Position).Magnitude)
+            end
+            statL.Text = "STATUS: " .. (hp <= 0 and "DEAD"
+                or r <= 0.25 and "CRITICAL"
+                or r <= 0.6 and "WOUNDED"
+                or "STABLE")
+            task.wait(0.12)
+        end
+        if token == scanToken then
+            task.wait(0.4)
+            if token == scanToken then stopScan() end
+        end
+    end)
+end
+
+-- Прицельная цель (скан/меч)
+local function getAimedTarget(range)
+    if not char then return nil end
+    local camPos = Camera.CFrame.Position
+    local vp = Camera.ViewportSize
+    local center = vp / 2
+    local maxR = math.min(vp.X, vp.Y) * 0.4
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {char}
+
+    local best, bestScore = nil, math.huge
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            local h = plr.Character:FindFirstChild("Head")
+            local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+            if h and hum and hum.Health > 0 then
+                local pos, onScreen = Camera:WorldToViewportPoint(h.Position)
+                if onScreen then
+                    local dist = (h.Position - camPos).Magnitude
+                    if dist > 1 and dist <= range then
+                        local screenDist = (Vector2.new(pos.X, pos.Y) - center).Magnitude
+                        if screenDist <= maxR and screenDist < bestScore then
+                            local hit = workspace:Raycast(camPos, (h.Position - camPos).Unit * dist, params)
+                            if hit and hit.Instance:IsDescendantOf(plr.Character) then
+                                best, bestScore = plr.Character, screenDist
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- АВТО-СКАН: сам сканирует прицел/ближайшего; после конца скана —
+-- сразу новый, если включен. Бесконечный сканер без перезарядки.
+task.spawn(function()
+    while true do
+        task.wait(0.4)
+        if autoScanOn and not flinging then
+            local t = getAimedTarget(CONFIG.SCAN_RANGE) or getNearestTarget(150)
+            if t then startScan(t) end
+        end
+    end
+end)
+
+--─────────────────── МОДУЛЬ 3: ФЛИНГ (дрон-камикадзе) ───────────────
+local function explodeAt(pos)
+    local flash = create("Part", {
+        Shape = Enum.PartType.Ball, Size = Vector3.new(1, 1, 1),
+        Material = Enum.Material.Neon, Color = CONFIG.C_GOLD,
+        Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
+        CFrame = CFrame.new(pos),
+    }, workspace)
+    TweenService:Create(flash, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        {Size = Vector3.new(14, 14, 14), Transparency = 1}):Play()
+    Debris:AddItem(flash, 0.55)
+
+    local wave = create("Part", {
+        Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.4, 1, 1),
+        Material = Enum.Material.Neon, Color = CONFIG.C_ORANGE, Transparency = 0.2,
+        Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
+        CFrame = CFrame.new(pos) * CFrame.Angles(0, 0, math.rad(90)),
+    }, workspace)
+    TweenService:Create(wave, TweenInfo.new(0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        {Size = Vector3.new(0.4, 18, 18), Transparency = 1}):Play()
+    Debris:AddItem(wave, 0.65)
+
+    local holder = create("Part", {
+        Size = Vector3.new(0.2, 0.2, 0.2), Transparency = 1,
+        Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
+        CFrame = CFrame.new(pos),
+    }, workspace)
+
+    local fire1 = create("ParticleEmitter", {
+        Texture = "rbxasset://textures/particles/fire_main.dds",
+        Color = ColorSequence.new(CONFIG.C_GOLD, CONFIG.C_ORANGE),
+        LightEmission = 1, Enabled = false,
+        Size = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1.4),
+            NumberSequenceKeypoint.new(1, 0.2),
+        }),
+        Lifetime = NumberRange.new(0.3, 0.7),
+        Speed = NumberRange.new(8, 16),
+        SpreadAngle = Vector2.new(180, 180), Drag = 4,
+    }, holder)
+    local smoke = create("ParticleEmitter", {
+        Texture = "rbxasset://textures/particles/smoke_main.dds",
+        Color = ColorSequence.new(Color3.fromRGB(70, 62, 55), Color3.fromRGB(30, 28, 25)),
+        Enabled = false, Acceleration = Vector3.new(0, 5, 0),
+        Size = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(1, 4.5),
+        }),
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0.35),
+            NumberSequenceKeypoint.new(1, 1),
+        }),
+        Lifetime = NumberRange.new(1, 2.2),
+        Speed = NumberRange.new(3, 8),
+        SpreadAngle = Vector2.new(180, 180), Drag = 2,
+    }, holder)
+    local sparks = create("ParticleEmitter", {
+        Texture = "rbxasset://textures/particles/sparkles_main.dds",
+        Color = ColorSequence.new(CONFIG.C_GOLD, Color3.fromRGB(255, 240, 180)),
+        LightEmission = 1, Enabled = false,
+        Size = NumberSequence.new(0.35),
+        Lifetime = NumberRange.new(0.4, 0.9),
+        Speed = NumberRange.new(15, 30),
+        SpreadAngle = Vector2.new(180, 180), Drag = 3,
+    }, holder)
+
+    fire1:Emit(45)
+    smoke:Emit(28)
+    sparks:Emit(60)
+
+    local light = create("PointLight", {Color = CONFIG.C_GOLD, Brightness = 10, Range = 32}, holder)
+    TweenService:Create(light, TweenInfo.new(0.5), {Brightness = 0}):Play()
+
+    local snd = create("Sound", {SoundId = "rbxassetid://165969964", Volume = 1}, holder)
+    snd:Play()
+    Debris:AddItem(holder, 3)
+end
+
+-- Дрон С ОРБИТЫ летит по дуге (Безье) к цели → взрыв → колбэк.
+-- Дрон снимается с орбиты ДО полёта: орбитальный цикл физически не
+-- может тронуть уничтоженную модель → зависших дронов нет.
+local function flyAndExplode(rig, tRoot, onDone)
+    local start = rig:GetPivot().Position
+    local t0 = os.clock()
+    local DUR = 0.55
+    local spin = 0
+    local finished = false
+    local function finish(exploded)
+        if finished then return end
+        finished = true
+        if exploded and tRoot.Parent then
+            explodeAt(tRoot.Position)
+        end
+        if rig.Parent then rig:Destroy() end
+        if onDone then onDone() end
+    end
+    local conn
+    conn = RunService.Heartbeat:Connect(function(dt)
+        if not rig.Parent then
+            conn:Disconnect()
+            finish(false)
+            return
+        end
+        if not tRoot.Parent then
+            conn:Disconnect()
+            finish(false)
+            return
+        end
+        local a = (os.clock() - t0) / DUR
+        local p2 = tRoot.Position
+        if a >= 1 then
+            conn:Disconnect()
+            finish(true)
+        else
+            -- Квадратичная Безье: P0 старт, P1 контроль сверху, P2 цель
+            local p1 = (start + p2) / 2 + Vector3.new(0, 5, 0)
+            local q = (1 - a) * (1 - a) * start + 2 * (1 - a) * a * p1 + a * a * p2
+            spin += dt * 22
+            rig:PivotTo(CFrame.lookAt(q, p2) * CFrame.Angles(spin, spin, 0))
+        end
+    end)
+end
+
+local function singleDroneStrike(targetChar, onDone)
+    local tRoot = targetChar:FindFirstChild("HumanoidRootPart")
+    local d = table.remove(drones, 1) -- снимаем с орбиты ДО полёта
+    if not (d and d.rig and tRoot) then
+        if onDone then task.defer(onDone) end
+        return
+    end
+    flyAndExplode(d.rig, tRoot, onDone)
+end
+
+local function stopAllVelocity()
+    pcall(function()
+        if char then
+            for _, p in ipairs(char:GetDescendants()) do
+                if p:IsA("BasePart") then
+                    p.AssemblyLinearVelocity = Vector3.zero
+                    p.AssemblyAngularVelocity = Vector3.zero
+                    p.Velocity = Vector3.zero
+                    p.RotVelocity = Vector3.zero
+                end
+            end
+        end
+    end)
+end
+
+local function respawnDronesSoon()
+    if droneOn then
+        task.delay(1.2, function()
+            if droneOn and #drones == 0 then createDrones() end
+        end)
+    end
+end
+
+-- SKIDFLING (техника zqyDSUWX) — работает, не трогаем
+local function skidFling(targetChar)
+    local Character = char
+    local Humanoid  = humanoid
+    local RootPart  = root
+    local TCharacter = targetChar
+    if not (Character and Humanoid and RootPart) then return end
+
+    local THumanoid = TCharacter:FindFirstChildOfClass("Humanoid")
+    local TRootPart = THumanoid and THumanoid.RootPart
+    local THead     = TCharacter:FindFirstChild("Head")
+    local Accessory = TCharacter:FindFirstChildOfClass("Accessory")
+    local Handle    = Accessory and Accessory:FindFirstChild("Handle")
+
+    if RootPart.AssemblyLinearVelocity.Magnitude < 50 then
+        OldPos = RootPart.CFrame
+    end
+
+    if THumanoid and THumanoid.Sit then
+        statusLabel.Text = "ЦЕЛЬ СИДИТ // ОТМЕНА"
+        return
+    end
+
+    if THead then
+        Camera.CameraSubject = THead
+    elseif Handle then
+        Camera.CameraSubject = Handle
+    elseif THumanoid and TRootPart then
+        Camera.CameraSubject = THumanoid
+    end
+
+    if not TCharacter:FindFirstChildWhichIsA("BasePart") then return end
+
+    local FPos = function(BasePart, Pos, Ang)
+        RootPart.CFrame = CFrame.new(BasePart.Position) * Pos * Ang
+        Character:PivotTo(CFrame.new(BasePart.Position) * Pos * Ang)
+        RootPart.Velocity = Vector3.new(9e7, 9e7 * 10, 9e7)
+        RootPart.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
+    end
+
+    local SFBasePart = function(BasePart)
+        local TimeToWait = CONFIG.FLING_TIME
+        local Time = tick()
+        local Angle = 0
+        repeat
+            if RootPart and THumanoid then
+                if BasePart.AssemblyLinearVelocity.Magnitude < 50 then
+                    Angle = Angle + 100
+                    FPos(BasePart, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection * BasePart.AssemblyLinearVelocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
+                    task.wait()
+                    FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection * BasePart.AssemblyLinearVelocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
+                    task.wait()
+                    FPos(BasePart, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection * BasePart.AssemblyLinearVelocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
+                    task.wait()
+                    FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection * BasePart.AssemblyLinearVelocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
+                    task.wait()
+                    FPos(BasePart, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(Angle), 0, 0))
+                    task.wait()
+                    FPos(BasePart, CFrame.new(0, -1.5, -THumanoid.WalkSpeed), CFrame.Angles(math.rad(Angle), 0, 0))
+                    task.wait()
+                else
+                    FPos(BasePart, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(90), 0, 0))
+                    task.wait()
+                    FPos(BasePart, CFrame.new(0, -1.5, -THumanoid.WalkSpeed), CFrame.Angles(0, 0, 0))
+                    task.wait()
+                    FPos(BasePart, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(90), 0, 0))
+                    task.wait()
+                    FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(90), 0, 0))
+                    task.wait()
+                    FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(0, 0, 0))
+                    task.wait()
+                    FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(90), 0, 0))
+                    task.wait()
+                    FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(0, 0, 0))
+                    task.wait()
+                end
+            end
+        until Time + TimeToWait < tick() or not flinging
+    end
+
+    pcall(function() workspace.FallenPartsDestroyHeight = 0/0 end)
+
+    local BV = Instance.new("BodyVelocity")
+    BV.Parent = RootPart
+    BV.Velocity = Vector3.new(0, 0, 0)
+    BV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+
+    Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+
+    if TRootPart then
+        SFBasePart(TRootPart)
+    elseif THead then
+        SFBasePart(THead)
+    elseif Handle then
+        SFBasePart(Handle)
+    else
+        BV:Destroy()
+        statusLabel.Text = "У ЦЕЛИ НЕТ ЧАСТЕЙ"
+        return
+    end
+
+    BV:Destroy()
+    Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, true)
+    Camera.CameraSubject = Humanoid
+
+    if OldPos then
+        local tries = 0
+        repeat
+            tries += 1
+            RootPart.CFrame = OldPos * CFrame.new(0, 0.5, 0)
+            Character:PivotTo(OldPos * CFrame.new(0, 0.5, 0))
+            Humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+            for _, part in pairs(Character:GetChildren()) do
+                if part:IsA("BasePart") then
+                    part.Velocity, part.RotVelocity = Vector3.new(), Vector3.new()
+                end
+            end
+            task.wait()
+        until (RootPart.Position - OldPos.Position).Magnitude < 25 or tries > 400
+        pcall(function() workspace.FallenPartsDestroyHeight = FPDH end)
+    end
+end
+
+-- ФЛИНГ: цель в радиусе FLING_RANGE (100 м)
+local function fire()
+    if not (char and root and root.Parent) then return end
+    if flinging then return end
+    if os.clock() - lastFire < 1.5 then return end
+
+    local targetChar = getNearestTarget(CONFIG.FLING_RANGE)
+    if not targetChar then
+        statusLabel.Text = "ЦЕЛЬ: НЕ НАЙДЕНА"
+        showNotice("ЦЕЛЬ НЕ НАЙДЕНА (до 100 м)", CONFIG.C_RED)
+        return
+    end
+    lastFire = os.clock()
+    flinging = true
+
+    task.delay(CONFIG.FLING_TIME + 8, function()
+        flinging = false
+    end)
+
+    local remote = ReplicatedStorage:FindFirstChild("EvilMortyFling")
+    local doFling = function()
+        if not (root and root.Parent) then flinging = false return end
+        if remote and remote:IsA("RemoteEvent") then
+            remote:FireServer(targetChar, 400000, 400000, 400000, CONFIG.FLING_TIME)
+            statusLabel.Text = "ЦЕЛЬ ЗАПУЩЕНА (СЕРВЕР)"
+            statusLabel.TextColor3 = CONFIG.C_GOLD
+            flinging = false
+            respawnDronesSoon()
+        else
+            statusLabel.Text = "ФЛИНГ // НАСОС..."
+            statusLabel.TextColor3 = CONFIG.C_ORANGE
+            task.spawn(function()
+                skidFling(targetChar)
+                statusLabel.Text = "ЦЕЛЬ ЗАПУЩЕНА"
+                statusLabel.TextColor3 = CONFIG.C_GOLD
+                flinging = false
+                respawnDronesSoon()
+            end)
+        end
+    end
+
+    singleDroneStrike(targetChar, doFling)
+    statusLabel.Text = "ДРОН НАВВОДИТСЯ..."
+    statusLabel.TextColor3 = CONFIG.C_ORANGE
+end
+
+--─────────────────────────── МЕЧ МОРТИ ──────────────────────────────
+-- Handle = КОРОТКАЯ РУКОЯТЬ (рука сжимает её), клинок приварен вверх.
+-- МЕЧ = БЛИЖНИЙ БОЙ (10 м): слэш + разрез + полный флинг-насос.
+local function giveSword()
+    local backpack = LocalPlayer:WaitForChild("Backpack")
+    if backpack:FindFirstChild("Меч Морти") or (char and char:FindFirstChild("Меч Морти")) then
+        showNotice("МЕЧ УЖЕ ВЫДАН", CONFIG.C_SUB)
+        return
+    end
+
+    local tool = Instance.new("Tool")
+    tool.Name = "Меч Морти"
+    tool.RequiresHandle = true
+    tool.CanBeDropped = true
+    tool.ToolTip = "Разрезает игрока надвое"
+
+    -- РУКОЯТЬ = Handle (короткая): рука держит её, а не лезвие
+    local handle = create("Part", {
+        Name = "Handle",
+        Size = Vector3.new(0.34, 0.9, 0.34),
+        Material = Enum.Material.Metal, Color = Color3.fromRGB(30, 25, 10),
+        CanCollide = false,
+    }, tool)
+
+    -- гарда
+    local guard = create("Part", {
+        Name = "Guard", Size = Vector3.new(0.62, 0.12, 0.62),
+        Material = Enum.Material.Metal, Color = CONFIG.C_GOLD_D,
+        CanCollide = false,
+    }, tool)
+    local w1 = Instance.new("Weld")
+    w1.Part0 = handle
+    w1.Part1 = guard
+    w1.C0 = CFrame.new(0, 0.51, 0)
+    w1.Parent = guard
+
+    -- клинок (неоновое золото, вверх)
+    local blade = create("Part", {
+        Name = "Blade", Size = Vector3.new(0.14, 2.3, 0.4),
+        Material = Enum.Material.Neon, Color = CONFIG.C_GOLD,
+        CanCollide = false,
+    }, tool)
+    local w2 = Instance.new("Weld")
+    w2.Part0 = handle
+    w2.Part1 = blade
+    w2.C0 = CFrame.new(0, 1.72, 0)
+    w2.Parent = blade
+
+    -- кончик
+    local tip = create("Part", {
+        Name = "Tip", Size = Vector3.new(0.14, 0.3, 0.2),
+        Material = Enum.Material.Neon, Color = Color3.fromRGB(255, 240, 180),
+        CanCollide = false,
+    }, tool)
+    local w3 = Instance.new("Weld")
+    w3.Part0 = handle
+    w3.Part1 = tip
+    w3.C0 = CFrame.new(0, 2.98, 0)
+    w3.Parent = tip
+
+    create("ParticleEmitter", {
+        Texture = "rbxasset://textures/particles/sparkles_main.dds",
+        Color = ColorSequence.new(CONFIG.C_GOLD),
+        LightEmission = 1, Size = NumberSequence.new(0.12),
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0.3),
+            NumberSequenceKeypoint.new(1, 1),
+        }),
+        Lifetime = NumberRange.new(0.3, 0.6),
+        Rate = 8, Speed = NumberRange.new(0.2, 0.6),
+        SpreadAngle = Vector2.new(180, 180),
+    }, blade)
+    create("PointLight", {Color = CONFIG.C_GOLD, Range = 6, Brightness = 1}, blade)
+
+    tool.Activated:Connect(function()
+        if swordBusy then return end
+        if os.clock() - lastFire < CONFIG.SWORD_COOLDOWN then return end
+
+        -- цель: БЛИЖНИЙ БОЙ — ближайший в радиусе клинка (10 м)
+        local targetChar = getNearestTarget(CONFIG.SWORD_RANGE)
+        local tRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+        if not (targetChar and tRoot and root) then
+            showNotice("ПОДОЙДИ БЛИЖЕ (10 м) // МЕЧ = БЛИЖНИЙ БОЙ", CONFIG.C_RED)
+            return
+        end
+        lastFire = os.clock()
+        swordBusy = true
+        flinging = true -- ФИКС: без этого насос обрывался после 1 кадра
+
+        -- золотая дуга-слэш
+        local a0 = Instance.new("Attachment")
+        a0.Parent = root
+        a0.Position = Vector3.new(0, 1, -1)
+        local a1 = Instance.new("Attachment")
+        a1.Parent = tRoot
+        local arc = create("Beam", {
+            Attachment0 = a0, Attachment1 = a1,
+            Color = ColorSequence.new(CONFIG.C_GOLD, Color3.fromRGB(255, 245, 200)),
+            Width0 = 0.5, Width1 = 0.1,
+            LightEmission = 1, FaceCamera = true,
+            Transparency = NumberSequence.new(0.05),
+        }, workspace)
+        TweenService:Create(arc, TweenInfo.new(0.3), {Width0 = 0, Width1 = 0}):Play()
+        Debris:AddItem(arc, 0.35)
+        Debris:AddItem(a0, 0.35)
+        Debris:AddItem(a1, 0.35)
+
+        -- «ПОЛОВИНЫ»: два блока разлетаются и тают
+        local mid = tRoot.Position
+        for _, side in ipairs({-1, 1}) do
+            local half = create("Part", {
+                Size = Vector3.new(1, 2, 0.6),
+                Material = Enum.Material.SmoothPlastic, Color = Color3.fromRGB(200, 200, 200),
+                Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
+                CFrame = CFrame.new(mid) * CFrame.Angles(0, 0, math.rad(side * 20)),
+            }, workspace)
+            TweenService:Create(half, TweenInfo.new(0.9, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                CFrame = half.CFrame * CFrame.new(side * 1.6, -2.2, 0) * CFrame.Angles(0, 0, math.rad(side * 70)),
+                Transparency = 1,
+            }):Play()
+            Debris:AddItem(half, 1)
+        end
+
+        -- цель улетает за карту (полный насос FLING_TIME)
+        task.spawn(function()
+            skidFling(targetChar)
+            flinging = false
+            swordBusy = false
+        end)
+        local plr = Players:GetPlayerFromCharacter(targetChar)
+        showNotice("РАЗРЕЗ // " .. (plr and plr.DisplayName or targetChar.Name), CONFIG.C_GOLD)
+    end)
+
+    tool.Parent = backpack
+    showNotice("МЕЧ МОРТИ // В ИНВЕНТАРЕ (хотбар)", CONFIG.C_GOLD)
+end
+
+--─────────────────────────── КНОПКИ UI ─────────────────────────────
+bDrones.btn.Activated:Connect(function()
+    click:Play()
+    droneOn = not droneOn
+    if droneOn then
+        if char and root and #drones == 0 then
+            createDrones()
+        elseif #drones == 0 then
+            droneOn = false
+        end
+    end
+    setDroneVisuals()
+    setButtonState(bDrones, droneOn)
+end)
+
+bFire.btn.Activated:Connect(function()
+    click:Play()
+    fire()
+end)
+
+bSword.btn.Activated:Connect(function()
+    click:Play()
+    giveSword()
+end)
+
+bTent.btn.Activated:Connect(function()
+    click:Play()
+    tentOn = not tentOn
+    if tentOn then
+        createTentacles()
+    else
+        clearTentacles()
+    end
+    setButtonState(bTent, tentOn)
+end)
+
+bMark.btn.Activated:Connect(function()
+    click:Play()
+    if playerList.Visible then
+        playerList.Visible = false
+        return
+    end
+    refreshPlayerList()
+    playerList.Visible = true
+end)
+
+-- ПРИСОСКА: держит ТОЛЬКО зафиксированную жертву
+bSuck.btn.Activated:Connect(function()
+    click:Play()
+    if suckTarget then
+        suckTarget = nil
+        if humanoid and humanoid.Parent then
+            humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+        end
+        setButtonState(bSuck, false)
+        showNotice("ПРИСОСКА: ОТПУЩЕНО", CONFIG.C_SUB)
+        return
+    end
+
+    local t = markedTarget or getNearestTarget(60)
+    local tRoot = t and t:FindFirstChild("HumanoidRootPart")
+    local tHum = t and t:FindFirstChildOfClass("Humanoid")
+    if t and tRoot and tHum and tHum.Health > 0 then
+        suckTarget = {char = t, hum = tHum, root = tRoot}
+        climbing = false
+        setButtonState(bSuck, true)
+        local plr = Players:GetPlayerFromCharacter(t)
+        showNotice("ПРИСОСКА К: " .. (plr and plr.DisplayName or t.Name), CONFIG.C_CYAN)
+    else
+        showNotice("СНАЧАЛА ВЫБЕРИ ЦЕЛЬ ИЗ СПИСКА", CONFIG.C_RED)
+    end
+end)
+
+-- СКАН: одного игрока (прицел или ближайший)
+bScan.btn.Activated:Connect(function()
+    click:Play()
+    local t = getAimedTarget(CONFIG.SCAN_RANGE) or getNearestTarget(150)
+    if t then
+        startScan(t)
+    else
+        showNotice("ЦЕЛЬ НЕ НАЙДЕНА", CONFIG.C_RED)
+    end
+end)
+
+bAuto.btn.Activated:Connect(function()
+    click:Play()
+    autoScanOn = not autoScanOn
+    bAuto.label.Text = autoScanOn and "АВТО-СКАН: ВКЛ" or "АВТО-СКАН: ВЫКЛ"
+    setButtonState(bAuto, autoScanOn)
+end)
+
+-- ТУМБЛЕР ПРОЗРАЧНОСТИ: панель становится полупрозрачной
+bGhost.btn.Activated:Connect(function()
+    click:Play()
+    ghostOn = not ghostOn
+    bGhost.label.Text = ghostOn and "ПРОЗРАЧНОСТЬ: ВКЛ" or "ПРОЗРАЧНОСТЬ: ВЫКЛ"
+    setButtonState(bGhost, ghostOn)
+    -- мгновенно применяем, если панель сейчас открыта
+    if isOpen then
+        panel.GroupTransparency = ghostTarget()
+    end
+end)
+
+-- УДАЛЕНИЕ ИНТЕРФЕЙСА: полностью уничтожает GUI (до перезахода)
+bClose.btn.Activated:Connect(function()
+    click:Play()
+    gui:Destroy() -- удаляет меню целиком; все функции в мире продолжают работать
+end)
+
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.E then
+        fire()
+    end
+end)
+
+UserInputService.JumpRequest:Connect(function()
+    jumpFlag = os.clock()
+end)
+
+--─────────────────────────── ГЛАВНЫЕ ЦИКЛЫ ─────────────────────────
+RunService.RenderStepped:Connect(function(dt)
+    for i = #rings, 1, -1 do
+        local r = rings[i]
+        if r.frame.Parent then
+            r.frame.Rotation = (r.frame.Rotation + r.speed * dt) % 360
+        else
+            table.remove(rings, i)
+        end
+    end
+
+    -- ПЛАВНОЕ жёлтое свечение скана: синусоида покадрово (без мерцания)
+    if scanOverlay.Visible then
+        scanOverlay.BackgroundTransparency = CONFIG.SCAN_GLOW
+            + math.sin(os.clock() * 2.2) * 0.07
+    end
+end)
+
+local statusTimer = 0
+
+RunService.Heartbeat:Connect(function(dt)
+    -- ОРБИТА ДРОНОВ: параметрическое уравнение окружности
+    --   x = cos(θ)·R,  z = sin(θ)·R
+    -- θ = t·SPEED + phase; phase = (i-1)·(2π/N) расставляет дроны по кругу.
+    if droneOn and root and root.Parent then
+        orbitTime += dt
+        local n = math.max(#drones, 1)
+        for i, d in ipairs(drones) do
+            local phase = (i - 1) * (math.pi * 2 / n)
+            local theta = orbitTime * CONFIG.ORBIT_SPEED + phase
+            local x = math.cos(theta) * CONFIG.ORBIT_RADIUS
+            local z = math.sin(theta) * CONFIG.ORBIT_RADIUS
+            local y = CONFIG.ORBIT_HEIGHT + math.sin(orbitTime * 1.7 + phase * 2) * CONFIG.ORBIT_BOB
+            local pos = root.Position + Vector3.new(x, y, z)
+            local look = CFrame.lookAt(pos, Vector3.new(root.Position.X, pos.Y, root.Position.Z))
+            local pivot = look * CFrame.Angles(0, math.sin(orbitTime * 1.5 + phase) * 0.4, 0)
+            if d.rig.Parent then -- защита: уничтоженный дрон не ломает цикл
+                d.rig:PivotTo(pivot)
+                for _, s in ipairs(d.spinners) do
+                    s.part.CFrame = pivot * s.rel * CFrame.Angles(orbitTime * CONFIG.ROTOR_SPEED * s.dir + s.phase, 0, 0)
+                end
+            end
+        end
+    end
+
+    -- ═══ ЩУПАЛЬЦА: ОДИН цикл, углы = доля дуги + живое колыхание ═════
+    -- Сумма углов по цепочке = TENT_ARC → дуга наружу, петля невозможна.
+    if tentOn and #tentacles > 0 then
+        for _, t in ipairs(tentacles) do
+            for si, m in ipairs(t.motors) do
+                if m.Part1 and m.Part1.Parent then
+                    m.DesiredAngle = t.baseRad[si]
+                        + math.sin(os.clock() * 1.8 + t.phase + si * 0.5) * 0.1
+                end
+            end
+        end
+    end
+
+    -- ═══ ПРИСОСКА: держит ТОЛЬКО зафиксированную жертву ═════════════
+    if suckTarget then
+        local myChar = suckTarget.char
+        local tRoot = myChar and myChar.Parent and myChar:FindFirstChild("HumanoidRootPart")
+        local tHum = suckTarget.hum
+        if not (tRoot and tHum.Parent and tHum.Health > 0) then
+            suckTarget = nil
+            setButtonState(bSuck, false)
+            if humanoid and humanoid.Parent then
+                humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+            end
+        elseif os.clock() - jumpFlag < 0.15 then
+            suckTarget = nil
+            setButtonState(bSuck, false)
+            root.AssemblyLinearVelocity = root.CFrame.LookVector * 24 + Vector3.new(0, 14, 0)
+            humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+            showNotice("ПРИСОСКА: ОТПУЩЕНО", CONFIG.C_SUB)
+        else
+            humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+            local behind = tRoot.CFrame * CFrame.new(0, 0, CONFIG.SUCK_OFFSET)
+            root.CFrame = CFrame.lookAt(behind.Position, behind.Position + tRoot.CFrame.LookVector)
+            root.AssemblyLinearVelocity = tRoot.AssemblyLinearVelocity
+        end
+    end
+
+    -- ═══ ЛАЗАНИЕ (веер лучей: углы, потолок) ═══════════════════════
+    if tentOn and root and humanoid and humanoid.Health > 0 and root.Parent
+        and not flinging and not suckTarget then
+
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = {char}
+
+        if not climbing then
+            local fwd = workspace:Raycast(root.Position, root.CFrame.LookVector * 2.9, params)
+            if fwd and math.abs(fwd.Normal.Y) < 0.98 and os.clock() > vaultUntil then
+                climbing = true
+                onCeiling = fwd.Normal.Y > 0.5
+                wallNormal = fwd.Normal
+                wallLostSince = nil
+            end
+        else
+            local dir = -wallNormal
+            local hit2 = workspace:Raycast(root.Position, dir * 3.4, params)
+            if not hit2 then
+                local rightV = Vector3.new(-wallNormal.Z, 0, wallNormal.X)
+                rightV = rightV.Magnitude > 0.01 and rightV.Unit or Vector3.xAxis
+                local probes = {
+                    (dir + Vector3.new(0, -0.55, 0)).Unit,
+                    (dir + Vector3.new(0, 0.55, 0)).Unit,
+                    (dir + rightV * 0.6).Unit,
+                    (dir - rightV * 0.6).Unit,
+                }
+                for _, pd in ipairs(probes) do
+                    hit2 = workspace:Raycast(root.Position, pd * 3.6, params)
+                    if hit2 then break end
+                end
+            end
+
+            if os.clock() - jumpFlag < 0.15 then
+                climbing = false
+                local n = wallNormal
+                wallNormal = nil
+                wallLostSince = nil
+                if onCeiling then
+                    root.AssemblyLinearVelocity = -n * 8
+                else
+                    root.AssemblyLinearVelocity = dir * CONFIG.LEAP_POWER + Vector3.new(0, 18, 0)
+                end
+                vaultUntil = os.clock() + 0.4
+                humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+            elseif not hit2 or math.abs(hit2.Normal.Y) > 0.98 then
+                if not wallLostSince then
+                    wallLostSince = os.clock()
+                    climbVel = root.AssemblyLinearVelocity.Y
+                end
+                humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+                if onCeiling then
+                    climbing = false
+                    wallNormal = nil
+                    wallLostSince = nil
+                    humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+                else
+                    root.AssemblyLinearVelocity = dir * 6 + Vector3.new(0, math.max(climbVel * 0.8, 12), 0)
+                    if os.clock() - wallLostSince > CONFIG.WALL_LOST_GRACE then
+                        climbing = false
+                        wallNormal = nil
+                        wallLostSince = nil
+                        root.AssemblyLinearVelocity = root.CFrame.LookVector * 16 + Vector3.new(0, CONFIG.VAULT_BOOST, 0)
+                        vaultUntil = os.clock() + 0.5
+                        humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+                    end
+                end
+            else
+                wallLostSince = nil
+                humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+                local normal = hit2.Normal
+                onCeiling = normal.Y < -0.5
+                wallNormal = normal
+                local yaw = math.atan2(normal.X, normal.Z)
+                root.CFrame = CFrame.new(root.Position) * CFrame.Angles(0, yaw, 0)
+
+                local move = humanoid.MoveDirection
+                local rightV = Vector3.new(-normal.Z, 0, normal.X)
+                rightV = rightV.Magnitude > 0.01 and rightV.Unit or Vector3.xAxis
+
+                if onCeiling then
+                    local flat = Vector3.new(move.X, 0, move.Z)
+                    root.AssemblyLinearVelocity = normal * 3 + flat * (CONFIG.CLIMB_SPEED * 0.9)
+                    climbVel = 0
+                else
+                    local intoWall = -move:Dot(normal)
+                    local vert = intoWall * CONFIG.CLIMB_SPEED
+                    local side = move:Dot(rightV) * CONFIG.CLIMB_SIDE
+                    climbVel = vert
+                    root.AssemblyLinearVelocity = normal * 2 + Vector3.new(0, vert, 0) + rightV * side
+                end
+            end
+        end
+    elseif climbing then
+        climbing = false
+        wallNormal = nil
+        wallLostSince = nil
+        if humanoid and humanoid.Parent then
+            humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+        end
+    end
+
+    statusTimer = statusTimer + dt
+    if suckTarget then
+        statusLabel.Text = "ПРИСОСКА // ПРОБЕЛ — ОТПУСТИТЬСЯ"
+        statusLabel.TextColor3 = CONFIG.C_CYAN
+    elseif climbing then
+        statusLabel.Text = onCeiling and "ПОТОЛОК // WASD — ПОЛЗАТЬ, ПРОБЕЛ — УПАСТЬ"
+            or "ЩУПАЛЬЦА // W↑ S↓ A/D←→ ПРОБЕЛ — ПРЫЖОК"
+        statusLabel.TextColor3 = CONFIG.C_CYAN
+    elseif statusTimer >= 0.25 and not flinging then
+        statusTimer = 0
+        local t, dist = getNearestTarget(60)
+        if t then
+            local plr = Players:GetPlayerFromCharacter(t)
+            statusLabel.Text = ("ЦЕЛЬ: %s · %.0f м"):format(plr and plr.Name or "?", dist)
+            statusLabel.TextColor3 = CONFIG.C_GOLD
+        else
+            statusLabel.Text = "ЦЕЛЬ: НЕ НАЙДЕНА"
+            statusLabel.TextColor3 = CONFIG.C_SUB
+        end
+    end
+end)
+
+--─────────────────────────── ПЕРСОНАЖ ──────────────────────────────
+local function onCharacterAdded(c)
+    char     = c
+    root     = c:WaitForChild("HumanoidRootPart")
+    head     = c:WaitForChild("Head")
+    humanoid = c:WaitForChild("Humanoid")
+    torso    = c:WaitForChild("Torso") -- R6: до создания щупалец
+    orbitTime = 0
+    meshAsset = nil
+    flinging = false
+    climbing = false
+    onCeiling = false
+    suckTarget = nil
+    markedTarget = nil
+    wallNormal = nil
+    OldPos = nil
+
+    clearDrones()
+    clearTentacles()
+    stopScan()
+    attachMesh() -- повязка всегда надета
+    if droneOn then createDrones() end
+    if tentOn then createTentacles() end
+
+    humanoid.Died:Connect(function()
+        clearDrones()
+        clearTentacles()
+        climbing = false
+        suckTarget = nil
+        wallNormal = nil
+        stopScan()
+    end)
+end
+
+updateScale()
+Camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
+
+LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
+if LocalPlayer.Character then
+    task.spawn(onCharacterAdded, LocalPlayer.Character)
+end
