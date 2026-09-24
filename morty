@@ -1,11 +1,12 @@
 --═══════════════════════════════════════════════════════════════════
---  EVIL MORTY // VFX CORE v54 — ОДИН LocalScript
+--  EVIL MORTY // VFX CORE v56 — ОДИН LocalScript
 --  Куда: StarterPlayer → StarterPlayerScripts | Риг: R6
---  v54: удар меча оставляет ЖЁЛТЫЙ ЭФФЕКТ (вспышка, кольцо, искры,
+--  v56: панель ВЕРНУТА к 280×620 (как была), увеличена ТОЛЬКО
+--  иконка EM (72×72) для открытия меню
+--  Удар меча оставляет ЖЁЛТЫЙ ЭФФЕКТ (вспышка, кольцо, искры,
 --  крест-слэш, золотая подсветка жертвы, половины со шлейфом)
 --  В меню есть ВРЕМЯ ФЛИНГА (1/2/3/5/8/12 сек)
---  Красная кнопка «✕ УДАЛИТЬ ВСЁ» сносит всё (GUI, дроны, щупальца,
---  меч, скан, повязку, все циклы и соединения)
+--  Красная кнопка «✕ УДАЛИТЬ ВСЁ» сносит всё
 --  ЩУПАЛЬЦА: Motor6D-веер · СКАН: 8 сек + АВТО-СКАН бесконечный
 --  ФЛИНГ: 100 м + регулируемое время · МЕЧ: ближний бой 10 м
 --  ПРИСОСКА: держит выбранную жертву · Повязка всегда надета
@@ -38,6 +39,10 @@ local CONFIG = {
 
     -- ЛОГО В ШАПКЕ (должен быть ID КАРТИНКИ/ДЕКАЛЯ, не модели!)
     LOGO_ID = "rbxassetid://102415835281067",
+
+    -- ИКОНКА МЕНЮ (v56: увеличена)
+    TOGGLE_SIZE  = 72,
+    TOGGLE_TEXT  = 28,
 
     -- ДРОНЫ
     DRONE_COUNT  = 3,
@@ -563,11 +568,12 @@ local function showNotice(text, color)
     end)
 end
 
+-- v56: иконка EM УВЕЛИЧЕНА (TOGGLE_SIZE = 72), панель — как была
 local toggleBtn = create("TextButton", {
-    Size = UDim2.fromOffset(52, 52),
+    Size = UDim2.fromOffset(CONFIG.TOGGLE_SIZE, CONFIG.TOGGLE_SIZE),
     Position = UDim2.new(1, -16, 1, -16), AnchorPoint = Vector2.new(1, 1),
     BackgroundColor3 = Color3.fromRGB(18, 14, 4), Text = "EM",
-    TextColor3 = CONFIG.C_GOLD, Font = Enum.Font.PermanentMarker, TextSize = 20,
+    TextColor3 = CONFIG.C_GOLD, Font = Enum.Font.PermanentMarker, TextSize = CONFIG.TOGGLE_TEXT,
     AutoButtonColor = false, BorderSizePixel = 0, ZIndex = 5,
 }, gui)
 create("UICorner", {CornerRadius = UDim.new(1, 0)}, toggleBtn)
@@ -1493,7 +1499,7 @@ local function fire()
 end
 
 --─────────────────────────── МЕЧ МОРТИ ──────────────────────────────
--- ЖЁЛТЫЙ ЭФФЕКТ УДАРА (v54): вспышка-шар, золотое кольцо, сноп искр,
+-- ЖЁЛТЫЙ ЭФФЕКТ УДАРА: вспышка-шар, золотое кольцо, сноп искр,
 -- крест-слэш из двух дуг, затухающий свет — остаётся в точке разреза
 local function swordHitFX(pos)
     -- 1) Вспышка-шар (неоновое золото)
