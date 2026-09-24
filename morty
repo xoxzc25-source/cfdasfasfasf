@@ -1,11 +1,13 @@
 --═══════════════════════════════════════════════════════════════════
---  EVIL MORTY // VFX CORE v50 — ОДИН LocalScript
+--  EVIL MORTY // VFX CORE v54 — ОДИН LocalScript
 --  Куда: StarterPlayer → StarterPlayerScripts | Риг: R6
---  НОВОЕ: лого «Злой Морти» в шапке (rbxassetid://102415835281067),
---  тумблер ПРОЗРАЧНОСТИ панели, кнопка УДАЛИТЬ ИНТЕРФЕЙС
---  ЩУПАЛЬЦА: Motor6D-веер (дуги наружу, без петель), один цикл анимации
---  СКАН: старый скан одного игрока (8 сек) + АВТО-СКАН бесконечный
---  ФЛИНГ: 100 м + крутилка времени · МЕЧ: ближний бой 10 м, насос
+--  v54: удар меча оставляет ЖЁЛТЫЙ ЭФФЕКТ (вспышка, кольцо, искры,
+--  крест-слэш, золотая подсветка жертвы, половины со шлейфом)
+--  В меню есть ВРЕМЯ ФЛИНГА (1/2/3/5/8/12 сек)
+--  Красная кнопка «✕ УДАЛИТЬ ВСЁ» сносит всё (GUI, дроны, щупальца,
+--  меч, скан, повязку, все циклы и соединения)
+--  ЩУПАЛЬЦА: Motor6D-веер · СКАН: 8 сек + АВТО-СКАН бесконечный
+--  ФЛИНГ: 100 м + регулируемое время · МЕЧ: ближний бой 10 м
 --  ПРИСОСКА: держит выбранную жертву · Повязка всегда надета
 --═══════════════════════════════════════════════════════════════════
 
@@ -13,6 +15,7 @@ local Players           = game:GetService("Players")
 local RunService        = game:GetService("RunService")
 local TweenService      = game:GetService("TweenService")
 local UserInputService  = game:GetService("UserInputService")
+local ContentProvider   = game:GetService("ContentProvider")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Debris            = game:GetService("Debris")
 
@@ -30,7 +33,10 @@ local CONFIG = {
     MESH_FORCE_BLACK = {},  -- имена деталей-ЛЕНТЫ (чёрный всегда)
     MESH_DEBUG       = false,
 
-    -- ЛОГО В ШАПКЕ (формат rbxassetid://ID; ScaleType.Fit = без искажений)
+    -- Кнопка «УДАЛИТЬ ВСЁ»: снимать ли повязку с персонажа
+    REMOVE_BAND_ON_CLOSE = true,
+
+    -- ЛОГО В ШАПКЕ (должен быть ID КАРТИНКИ/ДЕКАЛЯ, не модели!)
     LOGO_ID = "rbxassetid://102415835281067",
 
     -- ДРОНЫ
@@ -55,7 +61,7 @@ local CONFIG = {
     -- ПРИСОСКА
     SUCK_OFFSET = 2.6,
 
-    -- ФЛИНГ / МЕЧ
+    -- ФЛИНГ / МЕЧ (FLING_TIME меняется кнопкой в меню!)
     FLING_TIME     = 3,
     FLING_RANGE    = 100,
     SWORD_RANGE    = 10,
@@ -79,6 +85,9 @@ local CONFIG = {
     C_SUB    = Color3.fromRGB(170, 145, 90),
 }
 
+-- Варианты длительности флинга для кнопки в меню
+local FLING_TIMES = {1, 2, 3, 5, 8, 12}
+
 -- Крепления на спине (локаль торса): y высота, x разлёт
 local TENT_SLOTS = {
     {y =  0.9, x = -0.55},
@@ -89,8 +98,7 @@ local TENT_SLOTS = {
     {y = -0.6, x =  0.85},
 }
 
--- СУММАРНЫЙ изгиб каждого щупальца (распределяется по суставам:
--- петля математически невозможна, дуги наружу-вверх/вниз)
+-- СУММАРНЫЙ изгиб каждого щупальца
 local TENT_ARC = {110, -110, 150, -150, 190, -190}
 
 local function create(class, props, parent)
@@ -123,10 +131,20 @@ local jumpFlag = 0
 local vaultUntil = 0
 local orbitTime, lastFire = 0, 0
 local flinging, isOpen, autoScanOn = false, false, false
-local ghostOn = false -- тумблер прозрачности панели
 local swordBusy = false
 local OldPos = nil
-local FPDH = workspace.FallenPartsDestroyHeight
+
+-- Безопасное чтение FallenPartsDestroyHeight
+local okFPDH, FPDH = pcall(function() return workspace.FallenPartsDestroyHeight end)
+if not okFPDH or type(FPDH) ~= "number" then FPDH = -500 end
+
+-- ЖИЗНЬ СКРИПТА: после «УДАЛИТЬ ВСЁ» = false, все циклы/связи гаснут
+local alive = true
+local conns = {}
+local function bind(conn)
+    table.insert(conns, conn)
+    return conn
+end
 
 local MESH_OFFSET = CFrame.new(CONFIG.MESH_POS)
     * CFrame.Angles(math.rad(CONFIG.MESH_ROT.X), math.rad(CONFIG.MESH_ROT.Y), math.rad(CONFIG.MESH_ROT.Z))
@@ -138,8 +156,6 @@ local function detachMesh()
     if meshAsset then meshAsset:Destroy() meshAsset = nil end
 end
 
--- game:GetObjects("rbxassetid://...") — клиентская загрузка инстансов
--- ассета без серверных прав. Возвращает ТАБЛИЦУ — берём несущий объект.
 local function loadMeshAsset()
     if cachedAsset then return cachedAsset:Clone() end
     local stored = ReplicatedStorage:FindFirstChild("EM_Headband")
@@ -189,16 +205,13 @@ local function attachMesh()
         end
     end
 
-    -- ПРАВИЛА: MESH_KEEP → провода (не трогать); MESH_FORCE_BLACK → лента.
-    -- Автомат: насыщенный Color/VertexColor (синие/красные провода) → не
-    -- трогаем; нейтральное → чёрное (VertexColor=0 нулит любую текстуру).
     local function sat(c)
         local _, s, v = c:ToHSV()
         return s >= 0.4 and v >= 0.3
     end
 
     for _, p in ipairs(parts) do
-        p.Anchored   = false -- сварка работает только с неякорными
+        p.Anchored   = false
         p.Massless   = true
         p.CanCollide = false
         p.CanQuery   = false
@@ -255,11 +268,11 @@ local function attachMesh()
     return true
 end
 
--- СТОРОЖ: повязку что-то снесло → вернуть за 1.5 сек (всегда надета)
+-- СТОРОЖ: повязку что-то снесло → вернуть за 1.5 сек
 task.spawn(function()
-    while true do
+    while alive do
         task.wait(1.5)
-        if char and head and head.Parent then
+        if alive and char and head and head.Parent then
             if not meshAsset or not meshAsset.Parent or meshAsset.Parent ~= char then
                 attachMesh()
             end
@@ -322,7 +335,6 @@ local function createDrone(i)
             CFrame = CFrame.new(pos + Vector3.new(0, 0.04, 0)),
         }), rig):SetAttribute("OT", 0)
 
-        -- Ось X базы повёрнута вертикально (roll 90°) → винт крутится Angles(angle,0,0)
         local rotorBase = CFrame.new(pos) * CFrame.Angles(0, 0, math.rad(90))
 
         local disc = create("Part", merge(HARD, {
@@ -390,8 +402,6 @@ local function setDroneVisuals()
 end
 
 --─────────── МОДУЛЬ 5: ЩУПАЛЬЦА (Motor6D-веер) ─────────────────────
--- Цепочка растёт вверх от спины. Суммарный изгиб (TENT_ARC) распределён
--- по суставам → дуги наружу, петля невозможна. Один цикл анимации.
 local function clearTentacles()
     for _, t in ipairs(tentacles) do t.rig:Destroy() end
     table.clear(tentacles)
@@ -415,13 +425,13 @@ local function createTentacles()
         local baseRad = {}
 
         local prevPart = torso
-        local jointC0 = CFrame.new(slot.x, slot.y, 0.55) -- сустав на спине
+        local jointC0 = CFrame.new(slot.x, slot.y, 0.55)
 
         for s = 1, CONFIG.TENT_SEGS do
             local w = 0.36 * (1 - (s - 1) / CONFIG.TENT_SEGS * 0.55)
             local seg = create("Part", {
                 Name = "Seg" .. s,
-                Size = Vector3.new(w, 0.42, w), -- длинная ось Y (вдоль цепочки)
+                Size = Vector3.new(w, 0.42, w),
                 Material = (s % 3 == 0) and Enum.Material.Neon or Enum.Material.Metal,
                 Color = (s % 3 == 0) and CONFIG.C_CYAN
                     or ((s % 2 == 0) and Color3.fromRGB(52, 56, 64) or Color3.fromRGB(36, 39, 45)),
@@ -433,24 +443,22 @@ local function createTentacles()
             m.Part0 = prevPart
             m.Part1 = seg
             if s == 1 then
-                m.C0 = jointC0                 -- сустав на спине
-                m.C1 = CFrame.new(0, -0.21, 0) -- низ блока у сустава
+                m.C0 = jointC0
+                m.C1 = CFrame.new(0, -0.21, 0)
             else
-                m.C0 = CFrame.new(0, 0.21, 0)  -- верх предыдущего блока
-                m.C1 = CFrame.new(0, -0.21, 0) -- низ этого блока
+                m.C0 = CFrame.new(0, 0.21, 0)
+                m.C1 = CFrame.new(0, -0.21, 0)
             end
-            m.MaxVelocity = 100 -- мгновенный отклик на синусоиду
+            m.MaxVelocity = 100
             m.Parent = prevPart
             table.insert(motors, m)
 
-            -- ДОЛЯ суммарного изгиба (равномерно + усиление к кончику)
             local share = totalArc / CONFIG.TENT_SEGS * (0.8 + s * 0.05)
             table.insert(baseRad, math.rad(share))
 
             prevPart = seg
         end
 
-        -- коготь: бирюзовое ядро + 4 золотых луча на кончике
         local last = rig:FindFirstChild("Seg" .. CONFIG.TENT_SEGS)
         if last then
             local core = create("Part", {
@@ -509,11 +517,10 @@ end
 --─────────────────────────── UI: ПАНЕЛЬ ────────────────────────────
 local gui = create("ScreenGui", {
     Name = "EvilMortyCore", ResetOnSpawn = false,
-    IgnoreGuiInset = true, -- заливка скана покрывает ВЕСЬ экран (вкл. зону чата)
+    IgnoreGuiInset = true,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, LocalPlayer:WaitForChild("PlayerGui"))
 
--- ЖЁЛТАЯ ЗАЛИВКА ЭКРАНА (плавная, анимация в RenderStepped — без мерцания)
 local scanOverlay = create("Frame", {
     Size = UDim2.fromScale(1, 1),
     BackgroundColor3 = CONFIG.C_GOLD,
@@ -547,6 +554,7 @@ create("UICorner", {CornerRadius = UDim.new(0, 8)}, notice)
 create("UIStroke", {Color = CONFIG.C_GOLD, Thickness = 1.5}, notice)
 
 local function showNotice(text, color)
+    if not alive then return end
     notice.Text = text
     notice.TextColor3 = color or CONFIG.C_GOLD
     notice.Visible = true
@@ -564,7 +572,10 @@ local toggleBtn = create("TextButton", {
 }, gui)
 create("UICorner", {CornerRadius = UDim.new(1, 0)}, toggleBtn)
 local toggleStroke = create("UIStroke", {Color = CONFIG.C_GOLD, Thickness = 2.5}, toggleBtn)
-TweenService:Create(toggleStroke, TweenInfo.new(1.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {Transparency = 0.7}):Play()
+local toggleStrokeTween = TweenService:Create(toggleStroke,
+    TweenInfo.new(1.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+    {Transparency = 0.7})
+toggleStrokeTween:Play()
 
 local panel = create("CanvasGroup", {
     Size = UDim2.fromOffset(280, 620),
@@ -600,22 +611,53 @@ create("TextLabel", {
     TextXAlignment = Enum.TextXAlignment.Left,
 }, dragZone)
 
--- ЛОГО «ЗЛОЙ МОРТИ» — ImageLabel по rbxassetid://ID, ScaleType.Fit
--- (масштаб без искажений). Стоит СПРАВА в шапке. Если нужен зеркальный
--- разворот — поменяй Rotation на 180.
+-- ЛОГО «ЗЛОЙ МОРТИ» (с проверкой загрузки: битый ID → WARN + заглушка)
 if CONFIG.LOGO_ID ~= "" then
-    create("ImageLabel", {
+    local fallbackLogo = create("TextLabel", {
         AnchorPoint = Vector2.new(1, 0.5),
         Position = UDim2.new(1, -10, 0.5, 0),
         Size = UDim2.fromOffset(100, 34),
         BackgroundTransparency = 1,
-        Image = CONFIG.LOGO_ID,            -- ← rbxassetid://102415835281067
-        ScaleType = Enum.ScaleType.Fit,    -- вписать без искажений
+        Font = Enum.Font.PermanentMarker,
+        Text = "ЗЛОЙ МОРТИ",
+        TextColor3 = CONFIG.C_GOLD,
+        TextSize = 15,
+        Visible = false,
     }, dragZone)
+
+    local logo = create("ImageLabel", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -10, 0.5, 0),
+        Size = UDim2.fromOffset(100, 34),
+        BackgroundTransparency = 1,
+        Image = CONFIG.LOGO_ID,
+        ScaleType = Enum.ScaleType.Fit,
+    }, dragZone)
+
+    task.spawn(function()
+        local failed = false
+        pcall(function()
+            ContentProvider:PreloadAsync({logo}, function(_, status)
+                if status == Enum.AssetFetchStatus.Failure then failed = true end
+            end)
+        end)
+        local t0 = os.clock()
+        while os.clock() - t0 < 3 and not logo.IsLoaded do
+            task.wait(0.1)
+        end
+        if failed or not logo.IsLoaded then
+            warn("[EvilMorty] ЛОГО НЕ ЗАГРУЗИЛСЯ: " .. CONFIG.LOGO_ID
+                .. " — проверь, что это ID КАРТИНКИ/ДЕКАЛЯ (не модели/меша!). Показана заглушка.")
+            logo.Visible = false
+            fallbackLogo.Visible = true
+        end
+    end)
 end
 
+-- Декоративные кольца в шапке
 local rings = {}
 local function makeRing(diameter, thickness, speed, transparency, parent, pos)
+    parent = parent or dragZone
     local ring = create("Frame", {
         AnchorPoint = Vector2.new(0.5, 0.5), Position = pos or UDim2.new(1, -34, 0.5, 0),
         Size = UDim2.fromOffset(diameter, diameter),
@@ -667,16 +709,22 @@ local function makeButton(key, text, yPos)
     return {btn = btn, label = label, dot = dot, stroke = stroke}
 end
 
-local bDrones = makeButton("Drones", "ДРОНЫ // ОРБИТА",      66)
-local bFire   = makeButton("Fire",   "ФЛИНГ // SKIDFLING",   106)
-local bSword  = makeButton("Sword",  "МЕЧ МОРТИ",            146)
-local bTent   = makeButton("Tent",   "ЩУПАЛЬЦА",             186)
-local bMark   = makeButton("Mark",   "ВЫБРАТЬ ЦЕЛЬ",         226)
-local bSuck   = makeButton("Suck",   "ПРИСОСКА // ЗА СПИНУ", 266)
-local bScan   = makeButton("Scan",   "СКАН МОЗГА",           306)
-local bAuto   = makeButton("Auto",   "АВТО-СКАН: ВЫКЛ",       346)
-local bGhost  = makeButton("Ghost",  "ПРОЗРАЧНОСТЬ: ВЫКЛ",    386)
-local bClose  = makeButton("Close",  "✕ УДАЛИТЬ ИНТЕРФЕЙС",   426)
+local bDrones    = makeButton("Drones",    "ДРОНЫ // ОРБИТА",        66)
+local bFire      = makeButton("Fire",      "ФЛИНГ // SKIDFLING",    106)
+local bFlingTime = makeButton("FlingTime", "ВРЕМЯ ФЛИНГА: " .. CONFIG.FLING_TIME .. "с", 146)
+local bSword     = makeButton("Sword",     "МЕЧ МОРТИ",             186)
+local bTent      = makeButton("Tent",      "ЩУПАЛЬЦА",              226)
+local bMark      = makeButton("Mark",      "ВЫБРАТЬ ЦЕЛЬ",          266)
+local bSuck      = makeButton("Suck",      "ПРИСОСКА // ЗА СПИНУ",  306)
+local bScan      = makeButton("Scan",      "СКАН МОЗГА",            346)
+local bAuto      = makeButton("Auto",      "АВТО-СКАН: ВЫКЛ",        386)
+local bClose     = makeButton("Close",     "✕ УДАЛИТЬ ВСЁ",          426)
+
+-- Кнопка удаления — КРАСНАЯ
+bClose.stroke.Color = CONFIG.C_RED
+bClose.stroke.Transparency = 0
+bClose.dot.BackgroundColor3 = CONFIG.C_RED
+bClose.label.TextColor3 = CONFIG.C_RED
 
 local function setButtonState(b, on)
     b.stroke.Color = on and CONFIG.C_GOLD or CONFIG.C_DIM
@@ -685,12 +733,12 @@ local function setButtonState(b, on)
     b.label.TextColor3 = on and CONFIG.C_GOLD or CONFIG.C_TEXT
 end
 
--- СПИСОК ИГРОКОВ
+-- СПИСОК ИГРОКОВ (Active = true — клики не прожимают кнопки под ним)
 local playerList = create("Frame", {
     Size = UDim2.new(1, -28, 0, 116),
     Position = UDim2.fromOffset(14, 262),
     BackgroundColor3 = Color3.fromRGB(14, 11, 4),
-    BorderSizePixel = 0, Visible = false, ZIndex = 6,
+    BorderSizePixel = 0, Visible = false, ZIndex = 6, Active = true,
 }, panel)
 create("UICorner", {CornerRadius = UDim.new(0, 8)}, playerList)
 create("UIStroke", {Color = CONFIG.C_GOLD, Thickness = 1.2}, playerList)
@@ -699,7 +747,7 @@ local scroll = create("ScrollingFrame", {
     Size = UDim2.new(1, -8, 1, -8), Position = UDim2.fromOffset(4, 4),
     BackgroundTransparency = 1, BorderSizePixel = 0,
     ScrollBarThickness = 3, ScrollBarImageColor3 = CONFIG.C_GOLD,
-    CanvasSize = UDim2.new(0, 0, 0, 0), ZIndex = 6,
+    CanvasSize = UDim2.new(0, 0, 0, 0), ZIndex = 6, Active = true,
 }, playerList)
 create("UIListLayout", {Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder}, scroll)
 
@@ -709,8 +757,10 @@ local function refreshPlayerList()
     end
     local list = Players:GetPlayers()
     table.sort(list, function(a, b) return a.DisplayName:lower() < b.DisplayName:lower() end)
+    local shown = 0
     for idx, plr in ipairs(list) do
         if plr ~= LocalPlayer then
+            shown += 1
             local item = create("TextButton", {
                 Size = UDim2.new(1, -6, 0, 25),
                 BackgroundColor3 = Color3.fromRGB(24, 19, 8),
@@ -750,7 +800,7 @@ local function refreshPlayerList()
             end)
         end
     end
-    scroll.CanvasSize = UDim2.new(0, 0, 0, #list * 28)
+    scroll.CanvasSize = UDim2.new(0, 0, 0, shown * 28)
 end
 
 local statusFrame = create("Frame", {
@@ -773,11 +823,6 @@ create("TextLabel", {
     TextSize = 9, TextColor3 = Color3.fromRGB(140, 115, 50),
 }, panel)
 
--- Тумблер прозрачности меняет GroupTransparency всей панели
-local function ghostTarget()
-    return ghostOn and 0.5 or 0
-end
-
 local function setOpen(v)
     isOpen = v
     click:Play()
@@ -786,7 +831,7 @@ local function setOpen(v)
         panel.Visible = true
         panel.GroupTransparency = 1
         uiScale.Scale = targetScale * 0.85
-        TweenService:Create(panel, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {GroupTransparency = ghostTarget()}):Play()
+        TweenService:Create(panel, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {GroupTransparency = 0}):Play()
         TweenService:Create(uiScale, TweenInfo.new(0.28, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Scale = targetScale}):Play()
     else
         TweenService:Create(panel, TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {GroupTransparency = 1}):Play()
@@ -830,7 +875,8 @@ toggleBtn.InputBegan:Connect(function(input)
     end
 end)
 
-UserInputService.InputChanged:Connect(function(input)
+bind(UserInputService.InputChanged:Connect(function(input)
+    if not alive then return end
     if not isMove(input) then return end
     if panelDrag then
         local d = input.Position - panelStart
@@ -843,14 +889,14 @@ UserInputService.InputChanged:Connect(function(input)
         toggleBtn.Position = UDim2.new(btnStartPos.X.Scale, btnStartPos.X.Offset + d.X,
                                        btnStartPos.Y.Scale, btnStartPos.Y.Offset + d.Y)
     end
-end)
+end))
 
-UserInputService.InputEnded:Connect(function(input)
+bind(UserInputService.InputEnded:Connect(function(input)
     if isTouch(input) then
         panelDrag = false
         btnDrag = false
     end
-end)
+end))
 
 toggleBtn.Activated:Connect(function()
     if btnMoved then btnMoved = false return end
@@ -858,9 +904,6 @@ toggleBtn.Activated:Connect(function()
 end)
 
 --───────────────────── МОДУЛЬ 4: СКАН (одного игрока) ──────────────
--- Прицел или ближайший → треугольник-голограмма, живой HP, луч от
--- повязки, жёлтое свечение экрана, 8 сек. АВТО-СКАН сам запускает
--- новый скан после окончания предыдущего.
 local scanToken = 0
 local scanRefs = {gui = nil, triGui = nil, beam = nil, atts = {}, hl = nil, light = nil, target = nil}
 
@@ -937,7 +980,6 @@ local function startScan(targetChar)
     local token = scanToken
     scanRefs.target = targetChar
 
-    -- заливка экрана: ПЛАВНОЕ свечение в RenderStepped (без мерцания)
     scanOverlay.Visible = true
     scanOverlay.BackgroundTransparency = 1
 
@@ -1081,7 +1123,6 @@ local function startScan(targetChar)
     end)
 end
 
--- Прицельная цель (скан/меч)
 local function getAimedTarget(range)
     if not char then return nil end
     local camPos = Camera.CFrame.Position
@@ -1118,12 +1159,11 @@ local function getAimedTarget(range)
     return best
 end
 
--- АВТО-СКАН: сам сканирует прицел/ближайшего; после конца скана —
--- сразу новый, если включен. Бесконечный сканер без перезарядки.
+-- АВТО-СКАН
 task.spawn(function()
-    while true do
+    while alive do
         task.wait(0.4)
-        if autoScanOn and not flinging then
+        if alive and autoScanOn and not flinging then
             local t = getAimedTarget(CONFIG.SCAN_RANGE) or getNearestTarget(150)
             if t then startScan(t) end
         end
@@ -1208,9 +1248,6 @@ local function explodeAt(pos)
     Debris:AddItem(holder, 3)
 end
 
--- Дрон С ОРБИТЫ летит по дуге (Безье) к цели → взрыв → колбэк.
--- Дрон снимается с орбиты ДО полёта: орбитальный цикл физически не
--- может тронуть уничтоженную модель → зависших дронов нет.
 local function flyAndExplode(rig, tRoot, onDone)
     local start = rig:GetPivot().Position
     local t0 = os.clock()
@@ -1228,7 +1265,7 @@ local function flyAndExplode(rig, tRoot, onDone)
     end
     local conn
     conn = RunService.Heartbeat:Connect(function(dt)
-        if not rig.Parent then
+        if not alive or not rig.Parent then
             conn:Disconnect()
             finish(false)
             return
@@ -1244,7 +1281,6 @@ local function flyAndExplode(rig, tRoot, onDone)
             conn:Disconnect()
             finish(true)
         else
-            -- Квадратичная Безье: P0 старт, P1 контроль сверху, P2 цель
             local p1 = (start + p2) / 2 + Vector3.new(0, 5, 0)
             local q = (1 - a) * (1 - a) * start + 2 * (1 - a) * a * p1 + a * a * p2
             spin += dt * 22
@@ -1255,7 +1291,7 @@ end
 
 local function singleDroneStrike(targetChar, onDone)
     local tRoot = targetChar:FindFirstChild("HumanoidRootPart")
-    local d = table.remove(drones, 1) -- снимаем с орбиты ДО полёта
+    local d = table.remove(drones, 1)
     if not (d and d.rig and tRoot) then
         if onDone then task.defer(onDone) end
         return
@@ -1281,7 +1317,7 @@ end
 local function respawnDronesSoon()
     if droneOn then
         task.delay(1.2, function()
-            if droneOn and #drones == 0 then createDrones() end
+            if alive and droneOn and #drones == 0 then createDrones() end
         end)
     end
 end
@@ -1327,7 +1363,7 @@ local function skidFling(targetChar)
     end
 
     local SFBasePart = function(BasePart)
-        local TimeToWait = CONFIG.FLING_TIME
+        local TimeToWait = CONFIG.FLING_TIME -- берётся на момент запуска
         local Time = tick()
         local Angle = 0
         repeat
@@ -1411,6 +1447,7 @@ end
 
 -- ФЛИНГ: цель в радиусе FLING_RANGE (100 м)
 local function fire()
+    if not alive then return end
     if not (char and root and root.Parent) then return end
     if flinging then return end
     if os.clock() - lastFire < 1.5 then return end
@@ -1456,8 +1493,92 @@ local function fire()
 end
 
 --─────────────────────────── МЕЧ МОРТИ ──────────────────────────────
--- Handle = КОРОТКАЯ РУКОЯТЬ (рука сжимает её), клинок приварен вверх.
--- МЕЧ = БЛИЖНИЙ БОЙ (10 м): слэш + разрез + полный флинг-насос.
+-- ЖЁЛТЫЙ ЭФФЕКТ УДАРА (v54): вспышка-шар, золотое кольцо, сноп искр,
+-- крест-слэш из двух дуг, затухающий свет — остаётся в точке разреза
+local function swordHitFX(pos)
+    -- 1) Вспышка-шар (неоновое золото)
+    local flash = create("Part", {
+        Shape = Enum.PartType.Ball, Size = Vector3.new(1, 1, 1),
+        Material = Enum.Material.Neon, Color = CONFIG.C_GOLD,
+        Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
+        Transparency = 0.05,
+        CFrame = CFrame.new(pos),
+    }, workspace)
+    TweenService:Create(flash, TweenInfo.new(0.45, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        {Size = Vector3.new(10, 10, 10), Transparency = 1}):Play()
+    Debris:AddItem(flash, 0.5)
+
+    -- 2) Расширяющееся золотое кольцо
+    local ring = create("Part", {
+        Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.25, 1, 1),
+        Material = Enum.Material.Neon, Color = Color3.fromRGB(255, 235, 140),
+        Transparency = 0.1,
+        Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
+        CFrame = CFrame.new(pos) * CFrame.Angles(0, 0, math.rad(90)),
+    }, workspace)
+    TweenService:Create(ring, TweenInfo.new(0.55, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        {Size = Vector3.new(0.25, 16, 16), Transparency = 1}):Play()
+    Debris:AddItem(ring, 0.6)
+
+    -- 3) Искры + золотое пламя
+    local holder = create("Part", {
+        Size = Vector3.new(0.2, 0.2, 0.2), Transparency = 1,
+        Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
+        CFrame = CFrame.new(pos),
+    }, workspace)
+
+    local sparks = create("ParticleEmitter", {
+        Texture = "rbxasset://textures/particles/sparkles_main.dds",
+        Color = ColorSequence.new(CONFIG.C_GOLD, Color3.fromRGB(255, 245, 190)),
+        LightEmission = 1, Enabled = false,
+        Size = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0.5),
+            NumberSequenceKeypoint.new(1, 0.05),
+        }),
+        Lifetime = NumberRange.new(0.4, 0.9),
+        Speed = NumberRange.new(10, 22),
+        SpreadAngle = Vector2.new(180, 180), Drag = 3,
+    }, holder)
+    local flames = create("ParticleEmitter", {
+        Texture = "rbxasset://textures/particles/fire_main.dds",
+        Color = ColorSequence.new(CONFIG.C_GOLD, CONFIG.C_ORANGE),
+        LightEmission = 1, Enabled = false,
+        Size = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1.2),
+            NumberSequenceKeypoint.new(1, 0.1),
+        }),
+        Lifetime = NumberRange.new(0.25, 0.5),
+        Speed = NumberRange.new(4, 10),
+        SpreadAngle = Vector2.new(180, 180), Drag = 4,
+    }, holder)
+    sparks:Emit(70)
+    flames:Emit(25)
+
+    -- 4) Затухающий золотой свет
+    local light = create("PointLight", {Color = CONFIG.C_GOLD, Brightness = 8, Range = 24}, holder)
+    TweenService:Create(light, TweenInfo.new(0.6), {Brightness = 0}):Play()
+
+    -- 5) КРЕСТ-СЛЭШ: две перекрещенные золотые дуги, закатываются в ноль
+    for _, rot in ipairs({35, -35}) do
+        local a0 = create("Attachment", {Position = Vector3.new(0, 2.2, 0)}, holder)
+        local a1 = create("Attachment", {Position = Vector3.new(0, -2.2, 0)}, holder)
+        local slash = create("Beam", {
+            Attachment0 = a0, Attachment1 = a1,
+            Color = ColorSequence.new(Color3.fromRGB(255, 245, 180), CONFIG.C_GOLD),
+            Width0 = 0.45, Width1 = 0.45,
+            LightEmission = 1, FaceCamera = true,
+            Transparency = NumberSequence.new(0.05),
+            CurveSize0 = rot, CurveSize1 = -rot,
+        }, holder)
+        TweenService:Create(slash, TweenInfo.new(0.4), {Width0 = 0, Width1 = 0}):Play()
+        Debris:AddItem(slash, 0.45)
+        Debris:AddItem(a0, 0.45)
+        Debris:AddItem(a1, 0.45)
+    end
+
+    Debris:AddItem(holder, 2)
+end
+
 local function giveSword()
     local backpack = LocalPlayer:WaitForChild("Backpack")
     if backpack:FindFirstChild("Меч Морти") or (char and char:FindFirstChild("Меч Морти")) then
@@ -1471,7 +1592,6 @@ local function giveSword()
     tool.CanBeDropped = true
     tool.ToolTip = "Разрезает игрока надвое"
 
-    -- РУКОЯТЬ = Handle (короткая): рука держит её, а не лезвие
     local handle = create("Part", {
         Name = "Handle",
         Size = Vector3.new(0.34, 0.9, 0.34),
@@ -1479,7 +1599,6 @@ local function giveSword()
         CanCollide = false,
     }, tool)
 
-    -- гарда
     local guard = create("Part", {
         Name = "Guard", Size = Vector3.new(0.62, 0.12, 0.62),
         Material = Enum.Material.Metal, Color = CONFIG.C_GOLD_D,
@@ -1491,7 +1610,6 @@ local function giveSword()
     w1.C0 = CFrame.new(0, 0.51, 0)
     w1.Parent = guard
 
-    -- клинок (неоновое золото, вверх)
     local blade = create("Part", {
         Name = "Blade", Size = Vector3.new(0.14, 2.3, 0.4),
         Material = Enum.Material.Neon, Color = CONFIG.C_GOLD,
@@ -1503,7 +1621,6 @@ local function giveSword()
     w2.C0 = CFrame.new(0, 1.72, 0)
     w2.Parent = blade
 
-    -- кончик
     local tip = create("Part", {
         Name = "Tip", Size = Vector3.new(0.14, 0.3, 0.2),
         Material = Enum.Material.Neon, Color = Color3.fromRGB(255, 240, 180),
@@ -1533,7 +1650,6 @@ local function giveSword()
         if swordBusy then return end
         if os.clock() - lastFire < CONFIG.SWORD_COOLDOWN then return end
 
-        -- цель: БЛИЖНИЙ БОЙ — ближайший в радиусе клинка (10 м)
         local targetChar = getNearestTarget(CONFIG.SWORD_RANGE)
         local tRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
         if not (targetChar and tRoot and root) then
@@ -1542,9 +1658,11 @@ local function giveSword()
         end
         lastFire = os.clock()
         swordBusy = true
-        flinging = true -- ФИКС: без этого насос обрывался после 1 кадра
+        flinging = true
 
-        -- золотая дуга-слэш
+        local mid = tRoot.Position
+
+        -- золотая дуга-слэш от клинка к цели
         local a0 = Instance.new("Attachment")
         a0.Parent = root
         a0.Position = Vector3.new(0, 1, -1)
@@ -1562,20 +1680,62 @@ local function giveSword()
         Debris:AddItem(a0, 0.35)
         Debris:AddItem(a1, 0.35)
 
-        -- «ПОЛОВИНЫ»: два блока разлетаются и тают
-        local mid = tRoot.Position
+        -- ЖЁЛТЫЙ ЭФФЕКТ УДАРА: вспышка + кольцо + искры + крест-слэш
+        swordHitFX(mid)
+
+        -- золотая вспышка-подсветка на самой жертве
+        local hl = create("Highlight", {
+            FillColor = CONFIG.C_GOLD, FillTransparency = 0.45,
+            OutlineColor = Color3.fromRGB(255, 235, 160), OutlineTransparency = 0.1,
+            DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+        }, targetChar)
+        TweenService:Create(hl, TweenInfo.new(0.8), {FillTransparency = 1, OutlineTransparency = 1}):Play()
+        Debris:AddItem(hl, 0.85)
+
+        -- «ПОЛОВИНЫ»: светятся золотом, тянут жёлтый шлейф, разлетаются и тают
         for _, side in ipairs({-1, 1}) do
             local half = create("Part", {
                 Size = Vector3.new(1, 2, 0.6),
-                Material = Enum.Material.SmoothPlastic, Color = Color3.fromRGB(200, 200, 200),
+                Material = Enum.Material.Neon, Color = Color3.fromRGB(255, 220, 120),
                 Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
                 CFrame = CFrame.new(mid) * CFrame.Angles(0, 0, math.rad(side * 20)),
             }, workspace)
+
+            -- жёлтый шлейф на половине
+            local ha0 = create("Attachment", {Position = Vector3.new(0, 1, 0)}, half)
+            local ha1 = create("Attachment", {Position = Vector3.new(0, -1, 0)}, half)
+            create("Trail", {
+                Attachment0 = ha0, Attachment1 = ha1, Lifetime = 0.4,
+                Color = ColorSequence.new(CONFIG.C_GOLD, Color3.fromRGB(255, 245, 200)),
+                Transparency = NumberSequence.new({
+                    NumberSequenceKeypoint.new(0, 0.1),
+                    NumberSequenceKeypoint.new(1, 1),
+                }),
+                LightEmission = 1, FaceCamera = true,
+            }, half)
+
+            -- искры с половины
+            create("ParticleEmitter", {
+                Texture = "rbxasset://textures/particles/sparkles_main.dds",
+                Color = ColorSequence.new(CONFIG.C_GOLD),
+                LightEmission = 1,
+                Size = NumberSequence.new(0.2),
+                Transparency = NumberSequence.new({
+                    NumberSequenceKeypoint.new(0, 0.2),
+                    NumberSequenceKeypoint.new(1, 1),
+                }),
+                Lifetime = NumberRange.new(0.3, 0.7),
+                Rate = 30, Speed = NumberRange.new(2, 6),
+                SpreadAngle = Vector2.new(180, 180),
+            }, half)
+
             TweenService:Create(half, TweenInfo.new(0.9, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
                 CFrame = half.CFrame * CFrame.new(side * 1.6, -2.2, 0) * CFrame.Angles(0, 0, math.rad(side * 70)),
                 Transparency = 1,
             }):Play()
             Debris:AddItem(half, 1)
+            Debris:AddItem(ha0, 1)
+            Debris:AddItem(ha1, 1)
         end
 
         -- цель улетает за карту (полный насос FLING_TIME)
@@ -1590,6 +1750,68 @@ local function giveSword()
 
     tool.Parent = backpack
     showNotice("МЕЧ МОРТИ // В ИНВЕНТАРЕ (хотбар)", CONFIG.C_GOLD)
+end
+
+--─────────────────────────── ПОЛНОЕ УДАЛЕНИЕ ВСЕГО ──────────────────
+local function killEverything()
+    if not alive then return end
+    alive = false
+
+    isOpen = false
+    flinging = false
+    droneOn = false
+    tentOn = false
+    autoScanOn = false
+    swordBusy = false
+    climbing = false
+    onCeiling = false
+    wallNormal = nil
+    wallLostSince = nil
+    suckTarget = nil
+    markedTarget = nil
+    markedPlayer = nil
+    OldPos = nil
+
+    -- мир: скан, дроны, щупальца
+    stopScan()
+    clearDrones()
+    clearTentacles()
+
+    -- вернуть персонажа и камеру в норму
+    pcall(function()
+        if humanoid and humanoid.Parent then
+            humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+            Camera.CameraSubject = humanoid
+        end
+    end)
+    stopAllVelocity()
+
+    -- забрать меч
+    pcall(function()
+        local bp = LocalPlayer:FindFirstChild("Backpack")
+        local t1 = bp and bp:FindFirstChild("Меч Морти")
+        if t1 then t1:Destroy() end
+        if char then
+            local t2 = char:FindFirstChild("Меч Морти")
+            if t2 then t2:Destroy() end
+        end
+    end)
+
+    -- повязка (можно оставить: REMOVE_BAND_ON_CLOSE = false)
+    if CONFIG.REMOVE_BAND_ON_CLOSE then
+        detachMesh()
+    end
+
+    -- убить все соединения и бесконечные циклы
+    pcall(function() toggleStrokeTween:Cancel() end)
+    for _, c in ipairs(conns) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(conns)
+
+    -- само меню
+    gui:Destroy()
+    print("[EvilMorty] Скрипт полностью удалён. Вернётся после перезахода.")
 end
 
 --─────────────────────────── КНОПКИ UI ─────────────────────────────
@@ -1610,6 +1832,17 @@ end)
 bFire.btn.Activated:Connect(function()
     click:Play()
     fire()
+end)
+
+-- ВРЕМЯ ФЛИНГА: перебор 1 → 2 → 3 → 5 → 8 → 12 → 1 ...
+local flingTimeIdx = table.find(FLING_TIMES, CONFIG.FLING_TIME) or 3
+
+bFlingTime.btn.Activated:Connect(function()
+    click:Play()
+    flingTimeIdx = (flingTimeIdx % #FLING_TIMES) + 1
+    CONFIG.FLING_TIME = FLING_TIMES[flingTimeIdx]
+    bFlingTime.label.Text = ("ВРЕМЯ ФЛИНГА: %dс"):format(CONFIG.FLING_TIME)
+    showNotice(("ДЛИТЕЛЬНОСТЬ ФЛИНГА: %d СЕК"):format(CONFIG.FLING_TIME), CONFIG.C_GOLD)
 end)
 
 bSword.btn.Activated:Connect(function()
@@ -1638,7 +1871,6 @@ bMark.btn.Activated:Connect(function()
     playerList.Visible = true
 end)
 
--- ПРИСОСКА: держит ТОЛЬКО зафиксированную жертву
 bSuck.btn.Activated:Connect(function()
     click:Play()
     if suckTarget then
@@ -1665,7 +1897,6 @@ bSuck.btn.Activated:Connect(function()
     end
 end)
 
--- СКАН: одного игрока (прицел или ближайший)
 bScan.btn.Activated:Connect(function()
     click:Play()
     local t = getAimedTarget(CONFIG.SCAN_RANGE) or getNearestTarget(150)
@@ -1683,37 +1914,26 @@ bAuto.btn.Activated:Connect(function()
     setButtonState(bAuto, autoScanOn)
 end)
 
--- ТУМБЛЕР ПРОЗРАЧНОСТИ: панель становится полупрозрачной
-bGhost.btn.Activated:Connect(function()
-    click:Play()
-    ghostOn = not ghostOn
-    bGhost.label.Text = ghostOn and "ПРОЗРАЧНОСТЬ: ВКЛ" or "ПРОЗРАЧНОСТЬ: ВЫКЛ"
-    setButtonState(bGhost, ghostOn)
-    -- мгновенно применяем, если панель сейчас открыта
-    if isOpen then
-        panel.GroupTransparency = ghostTarget()
-    end
-end)
-
--- УДАЛЕНИЕ ИНТЕРФЕЙСА: полностью уничтожает GUI (до перезахода)
 bClose.btn.Activated:Connect(function()
     click:Play()
-    gui:Destroy() -- удаляет меню целиком; все функции в мире продолжают работать
+    killEverything()
 end)
 
-UserInputService.InputBegan:Connect(function(input, gp)
-    if gp then return end
+bind(UserInputService.InputBegan:Connect(function(input, gp)
+    if not alive or gp then return end
     if input.KeyCode == Enum.KeyCode.E then
         fire()
     end
-end)
+end))
 
-UserInputService.JumpRequest:Connect(function()
+bind(UserInputService.JumpRequest:Connect(function()
     jumpFlag = os.clock()
-end)
+end))
 
 --─────────────────────────── ГЛАВНЫЕ ЦИКЛЫ ─────────────────────────
-RunService.RenderStepped:Connect(function(dt)
+bind(RunService.RenderStepped:Connect(function(dt)
+    if not alive then return end
+
     for i = #rings, 1, -1 do
         local r = rings[i]
         if r.frame.Parent then
@@ -1723,19 +1943,18 @@ RunService.RenderStepped:Connect(function(dt)
         end
     end
 
-    -- ПЛАВНОЕ жёлтое свечение скана: синусоида покадрово (без мерцания)
     if scanOverlay.Visible then
         scanOverlay.BackgroundTransparency = CONFIG.SCAN_GLOW
             + math.sin(os.clock() * 2.2) * 0.07
     end
-end)
+end))
 
 local statusTimer = 0
 
-RunService.Heartbeat:Connect(function(dt)
-    -- ОРБИТА ДРОНОВ: параметрическое уравнение окружности
-    --   x = cos(θ)·R,  z = sin(θ)·R
-    -- θ = t·SPEED + phase; phase = (i-1)·(2π/N) расставляет дроны по кругу.
+bind(RunService.Heartbeat:Connect(function(dt)
+    if not alive then return end
+
+    -- ОРБИТА ДРОНОВ
     if droneOn and root and root.Parent then
         orbitTime += dt
         local n = math.max(#drones, 1)
@@ -1748,7 +1967,7 @@ RunService.Heartbeat:Connect(function(dt)
             local pos = root.Position + Vector3.new(x, y, z)
             local look = CFrame.lookAt(pos, Vector3.new(root.Position.X, pos.Y, root.Position.Z))
             local pivot = look * CFrame.Angles(0, math.sin(orbitTime * 1.5 + phase) * 0.4, 0)
-            if d.rig.Parent then -- защита: уничтоженный дрон не ломает цикл
+            if d.rig.Parent then
                 d.rig:PivotTo(pivot)
                 for _, s in ipairs(d.spinners) do
                     s.part.CFrame = pivot * s.rel * CFrame.Angles(orbitTime * CONFIG.ROTOR_SPEED * s.dir + s.phase, 0, 0)
@@ -1757,8 +1976,7 @@ RunService.Heartbeat:Connect(function(dt)
         end
     end
 
-    -- ═══ ЩУПАЛЬЦА: ОДИН цикл, углы = доля дуги + живое колыхание ═════
-    -- Сумма углов по цепочке = TENT_ARC → дуга наружу, петля невозможна.
+    -- ЩУПАЛЬЦА
     if tentOn and #tentacles > 0 then
         for _, t in ipairs(tentacles) do
             for si, m in ipairs(t.motors) do
@@ -1770,7 +1988,7 @@ RunService.Heartbeat:Connect(function(dt)
         end
     end
 
-    -- ═══ ПРИСОСКА: держит ТОЛЬКО зафиксированную жертву ═════════════
+    -- ПРИСОСКА
     if suckTarget then
         local myChar = suckTarget.char
         local tRoot = myChar and myChar.Parent and myChar:FindFirstChild("HumanoidRootPart")
@@ -1795,7 +2013,7 @@ RunService.Heartbeat:Connect(function(dt)
         end
     end
 
-    -- ═══ ЛАЗАНИЕ (веер лучей: углы, потолок) ═══════════════════════
+    -- ЛАЗАНИЕ
     if tentOn and root and humanoid and humanoid.Health > 0 and root.Parent
         and not flinging and not suckTarget then
 
@@ -1918,15 +2136,16 @@ RunService.Heartbeat:Connect(function(dt)
             statusLabel.TextColor3 = CONFIG.C_SUB
         end
     end
-end)
+end))
 
 --─────────────────────────── ПЕРСОНАЖ ──────────────────────────────
 local function onCharacterAdded(c)
+    if not alive then return end
     char     = c
     root     = c:WaitForChild("HumanoidRootPart")
     head     = c:WaitForChild("Head")
     humanoid = c:WaitForChild("Humanoid")
-    torso    = c:WaitForChild("Torso") -- R6: до создания щупалец
+    torso    = c:WaitForChild("Torso") -- R6
     orbitTime = 0
     meshAsset = nil
     flinging = false
@@ -1940,7 +2159,7 @@ local function onCharacterAdded(c)
     clearDrones()
     clearTentacles()
     stopScan()
-    attachMesh() -- повязка всегда надета
+    attachMesh()
     if droneOn then createDrones() end
     if tentOn then createTentacles() end
 
@@ -1955,9 +2174,9 @@ local function onCharacterAdded(c)
 end
 
 updateScale()
-Camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
+bind(Camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale))
 
-LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
+bind(LocalPlayer.CharacterAdded:Connect(onCharacterAdded))
 if LocalPlayer.Character then
     task.spawn(onCharacterAdded, LocalPlayer.Character)
 end
